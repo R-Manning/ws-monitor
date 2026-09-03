@@ -1,0 +1,5 @@
+# Raspberry Pi sensor support. Install after base.txt on the Pi only.
+-r base.txt
+adafruit_blinka==8.64.0
+adafruit_circuitpython_dht==4.0.9
+adafruit_circuitpython_max31856==0.12.4

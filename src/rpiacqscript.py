@@ -1,290 +1,111 @@
-# RPi4 Stove Room Environment (consolidated & optimized)
+"""Standalone, fault-tolerant stove-room collector."""
 
-import math
+import argparse
+import signal
 import time
-import sqlite3
-from collections import deque
-from contextlib import closing
-from typing import Tuple
-from bisect import bisect_left, insort
-from dotenv import load_dotenv
-from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-env_path = Path(__file__).resolve().parents[1] / ".env"
-if not env_path.exists():
-    raise RuntimeError(f".env file not found at {env_path}")
-load_dotenv(env_path)
+from config import load_config
+from database import connect, delete_older_than, diagnose as diagnose_database, initialize, insert_sample, settings
+from logging_setup import configure_logging
+from sensors import create_reader
 
-import board
-import digitalio
-import adafruit_dht
-import adafruit_max31856
-
-from watchdog import watchdog, sensor_health_check
-from paths import get_db_path
+try:
+    from watchdog import sensor_health_check, watchdog
+except ImportError:  # Alerting is optional and must not disable collection.
+    sensor_health_check = None
+    watchdog = None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config / Globals
-# ──────────────────────────────────────────────────────────────────────────────
-dbname = str(get_db_path())
-dataTable = "stove_room"
-settingsTable = "settings"
-
-# median window size & sensor keys (raw °C inputs for filtering)
-window_size = 5
-keys = ["tempC", "humid", "flueC", "sttC"]
-
-# Populated from settings at startup (seconds / days)
-sampleFreq: float = 5.0
-dbHistory: int = 7
+def _c_to_f(value: Any, low: float, high: float) -> Optional[float]:
+    if not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    return round(min(high, max(low, value * 1.8 + 32)), 1)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# DB helpers
-# ──────────────────────────────────────────────────────────────────────────────
-def _connect() -> sqlite3.Connection:
-    """Open SQLite with WAL + NORMAL sync for lower contention & fsync cost."""
-    conn = sqlite3.connect(dbname, detect_types=sqlite3.PARSE_DECLTYPES, timeout=5)
-    with closing(conn.cursor()) as cur:
-        cur.execute("PRAGMA journal_mode=WAL;")
-        cur.execute("PRAGMA synchronous=NORMAL;")
-    return conn
+def convert_reading(raw: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    return {
+        "tempF": _c_to_f(raw.get("tempC"), 10, 125),
+        "humid": round(min(100, max(5, float(raw["humid"]))), 1) if isinstance(raw.get("humid"), (int, float)) else None,
+        "flueF": _c_to_f(raw.get("flueC"), 0, 1000),
+        "sttF": _c_to_f(raw.get("sttC"), 0, 1000),
+    }
 
 
-def _load_settings() -> Tuple[int, int]:
-    """Read (sampleFreq seconds, dbHistory days) from settings; provide safe defaults."""
-    with closing(_connect()) as conn, closing(conn.cursor()) as cur:
-        cur.execute(f'SELECT * FROM "{settingsTable}" LIMIT 1;')
-        row = cur.fetchone()
-    if not row:
-        return 5, 7
-    # row[0] = sample period (s), row[1] = db history (days)
-    s = int(row[0])
-    d = int(row[1]) if len(row) >= 2 else 7
-    return s, d
+def read_with_retries(reader: Any, retries: int, logger: Any) -> Dict[str, Optional[float]]:
+    last: Dict[str, Any] = {}
+    for attempt in range(retries + 1):
+        try:
+            last = reader.read()
+            return convert_reading(last)
+        except Exception as exc:
+            logger.warning("sensor read failed (attempt %d/%d): %s", attempt + 1, retries + 1, exc)
+            time.sleep(min(0.25 * (2 ** attempt), 2.0))
+    return convert_reading(last)
 
 
-def _startup_retention_cleanup(history_days: int) -> None:
-    """Delete old rows once at startup using parameter binding (no string concat)."""
-    with closing(_connect()) as conn, closing(conn.cursor()) as cur:
-        cur.execute(
-            f'''DELETE FROM "{dataTable}"
-                WHERE datetime <= date('now', printf('-%d day', ?));''',
-            (int(history_days),),
-        )
-        conn.commit()
-
-
-def _ensure_time_index() -> None:
-    """Create an index on datetime if it doesn't exist (idempotent)."""
-    with closing(_connect()) as conn, closing(conn.cursor()) as cur:
-        cur.execute(f'CREATE INDEX IF NOT EXISTS idx_{dataTable}_datetime ON "{dataTable}"(datetime);')
-        conn.commit()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Utility
-# ──────────────────────────────────────────────────────────────────────────────
-def _is_bad(x):
-    return x is None or (isinstance(x, float) and math.isnan(x))
-
-
-def _clamp(v, lo, hi):
-    if v < lo:
-        return lo
-    if v > hi:
-        return hi
-    return v
-
-
-class RunningMedian:
-    """Fixed-size running median without resorting the entire window each sample."""
-    def __init__(self, size: int):
-        self.size = int(size)
-        self.buffers = {k: deque(maxlen=size) for k in keys}
-        self.sorted = {k: [] for k in keys}
-
-    def add(self, sensor: str, value):
-        # Ignore invalids: don't change the window; return current median (or None)
-        if _is_bad(value):
-            arr = self.sorted[sensor]
-            n = len(arr)
-            if n == 0:
-                return None
-            mid = n // 2
-            return (arr[mid - 1] + arr[mid]) / 2 if n % 2 == 0 else arr[mid]
-
-        dq = self.buffers[sensor]
-        arr = self.sorted[sensor]
-
-        # If about to evict, remove matching value from the sorted list as well
-        if len(dq) == dq.maxlen:
-            old = dq[0]
-            if not _is_bad(old):
-                i = bisect_left(arr, old)
-                if i < len(arr) and arr[i] == old:
-                    arr.pop(i)
-
-        dq.append(value)
-        insort(arr, value)
-
-        n = len(arr)
-        mid = n // 2
-        return (arr[mid - 1] + arr[mid]) / 2 if n % 2 == 0 else arr[mid]
-
-
-median = RunningMedian(window_size)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Hardware init
-# ──────────────────────────────────────────────────────────────────────────────
-# SPI bus (thermocouples)
-spi = board.SPI()
-
-# DHT11 on GPIO18; respect DHT11 minimum read interval (~2s) at the callsite
-DHT_SENSOR = adafruit_dht.DHT11(board.D18)
-
-# Chip selects for MAX31856 thermocouples
-flue = digitalio.DigitalInOut(board.D5)
-flue.direction = digitalio.Direction.OUTPUT
-stt = digitalio.DigitalInOut(board.D6)
-stt.direction = digitalio.Direction.OUTPUT
-
-# Thermocouple objects (type K)
-flueT = adafruit_max31856.MAX31856(spi, flue, adafruit_max31856.ThermocoupleType.K)
-sttT = adafruit_max31856.MAX31856(spi, stt, adafruit_max31856.ThermocoupleType.K)
-thermocouples = (flueT, sttT)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Data I/O
-# ──────────────────────────────────────────────────────────────────────────────
-def logData(data: dict) -> None:
-    """Insert a single sample (now, localtime) with parameter binding."""
-    with closing(_connect()) as conn:
-        conn.execute(
-            f'''INSERT OR IGNORE INTO "{dataTable}"
-                VALUES (datetime('now','localtime'), ?, ?, ?, ?)''',
-            [data["tempF"], data["humid"], data["flueF"], data["sttF"]],
-        )
-        conn.commit()
-    watchdog()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Sampling
-# ──────────────────────────────────────────────────────────────────────────────
-def getData():
-    """
-    Read sensors, run median on raw °C values, convert to F, clamp to sane ranges.
-    Returns (data_dict, bad_set) — if any field is None, returns (None, bad_set).
-    """
-    bad = set()
-
-    # --- DHT11 (room temp/humidity) ---
+def run(config: Any, samples: Optional[int] = None, once: bool = False, diagnose: bool = False) -> int:
+    logger = configure_logging(config.log_level)
+    reader = create_reader(config.sensor_mode)
+    conn = connect(config.db_path)
     try:
-        humidity = DHT_SENSOR.humidity
-        temperature = DHT_SENSOR.temperature  # °C
-    except RuntimeError:
-        humidity, temperature = None, None
+        initialize(conn)
+        if diagnose:
+            print({"db_path": str(config.db_path), **diagnose_database(conn),
+                   "sensor_mode": type(reader).__name__, "sensors": reader.diagnose()})
+            return 0
+        interval, history = settings(conn, config.sample_interval, config.history_days)
+        delete_older_than(conn, history)
+        count = 0
+        stopped = False
 
-    tempC_med = median.add("tempC", temperature)
-    humid_med = median.add("humid", humidity)
+        def stop(_signum: int, _frame: Any) -> None:
+            nonlocal stopped
+            stopped = True
 
-    tempF = None if tempC_med is None else round(tempC_med * 1.8 + 32, 1)
-    humid = None if humid_med is None else round(humid_med)
-
-    if tempF is None:
-        bad.add("tempF")
-    if humid is None:
-        bad.add("humid")
-
-    # --- Thermocouples (flue/stove) ---
-    try:
-        flueC = thermocouples[0].temperature  # °C
-    except Exception:
-        flueC = None
-    try:
-        sttC = thermocouples[1].temperature  # °C
-    except Exception:
-        sttC = None
-
-    flueC_med = median.add("flueC", flueC)
-    sttC_med = median.add("sttC", sttC)
-
-    flueF = None if flueC_med is None else round(flueC_med * 1.8 + 32, 1)
-    sttF = None if sttC_med is None else round(sttC_med * 1.8 + 32, 1)
-
-    if flueF is None:
-        bad.add("flueF")
-    if sttF is None:
-        bad.add("sttF")
-
-    # If any invalid -> skip this tick (but report failing fields)
-    if bad:
-        return None, bad
-
-    # Clamp to sane ranges
-    tempF = _clamp(tempF, 10, 125)
-    humid = _clamp(humid, 5, 100)
-    flueF = _clamp(flueF, 0, 1000)
-    sttF = _clamp(sttF, 0, 1000)
-
-    return {"tempF": tempF, "humid": humid, "flueF": flueF, "sttF": sttF}, bad
+        signal.signal(signal.SIGINT, stop)
+        signal.signal(signal.SIGTERM, stop)
+        next_tick = time.monotonic()
+        while not stopped and (samples is None or count < samples) and not (once and count):
+            values = read_with_retries(reader, config.retries, logger)
+            insert_sample(conn, values)
+            if sensor_health_check is not None:
+                bad = {name for name, value in values.items() if value is None}
+                try:
+                    sensor_health_check(bad)
+                except Exception:
+                    logger.exception("sensor health alert failed")
+            if watchdog is not None:
+                try:
+                    watchdog(str(config.db_path))
+                except Exception:
+                    logger.exception("threshold alert failed")
+            logger.info("sample %d: %s", count + 1, values)
+            count += 1
+            if count % max(1, int(86400 / interval)) == 0:
+                delete_older_than(conn, history)
+            next_tick += max(2.0, interval)
+            time.sleep(max(0.0, next_tick - time.monotonic()))
+        return 0
+    finally:
+        conn.close()
 
 
-def dataAcquisition():
-    """Monotonic scheduler with daily retention cleanup."""
-    deleteElapsed = 0.0
-
-    # Enforce DHT11 minimum interval (~2s); honor setting otherwise
-    period = max(float(sampleFreq), 2.0)
-
-    next_tick = time.monotonic()  # schedule first tick immediately
-    while True:
-        now = time.monotonic()
-        if now >= next_tick:
-            data, bad = getData()
-            if data is not None:
-                logData(data)
-                sensor_health_check(set())  # mark all OK
-                deleteElapsed += period
-            else:
-                sensor_health_check(bad)
-
-            # schedule next sample; catch up if fell behind
-            next_tick += period
-            if next_tick < now:
-                next_tick = now + period
-
-            # once a day, delete data older than dbHistory days
-            if deleteElapsed >= 86400:
-                with closing(_connect()) as conn, closing(conn.cursor()) as cur:
-                    cur.execute(
-                        f'''DELETE FROM "{dataTable}"
-                            WHERE datetime <= date('now', printf('-%d day', ?));''',
-                        (int(dbHistory),),
-                    )
-                    conn.commit()
-                deleteElapsed = 0.0
-
-        # sleep until next tick without busy-waiting
-        time.sleep(max(0.01, next_tick - time.monotonic()))
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--samples", type=int, help="number of samples, then exit")
+    parser.add_argument("--once", action="store_true", help="collect one sample, then exit")
+    parser.add_argument("--diagnose", action="store_true", help="read sensors and print their status")
+    parser.add_argument("--sensor-mode", choices=("auto", "hardware", "simulated"), default=None)
+    parser.add_argument("--db-path", default=None)
+    args = parser.parse_args(argv)
+    if args.samples is not None and args.samples < 1:
+        parser.error("--samples must be positive")
+    return run(load_config(args.db_path, args.sensor_mode), args.samples, args.once, args.diagnose)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Startup
-# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Load settings and set globals
-    s, d = _load_settings()
-    sampleFreq, dbHistory = float(s), int(d)
-
-    # One-time DB maintenance
-    _ensure_time_index()
-    _startup_retention_cleanup(dbHistory)
-
-    # Run acquisition loop forever
-    dataAcquisition()
+    raise SystemExit(main())
