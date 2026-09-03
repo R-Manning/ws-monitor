@@ -137,12 +137,21 @@ celerybeat.pid
 # Environments
 .env
 .envrc
+.env.*
+!.env_template
+.env.*
+!.env_template
 .venv
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Runtime SQLite database and WAL sidecars
+*.db
+*.db-shm
+*.db-wal
 
 # Spyder project settings
 .spyderproject
@@ -180,6 +189,15 @@ cython_debug/
 
 # User-specific stuff
 .idea/**/workspace.xml
+
+# Runtime databases, logs, and macOS metadata
+*.db
+*.db-shm
+*.db-wal
+var/
+runtime/
+logs/
+.DS_Store
 .idea/**/tasks.xml
 .idea/**/usage.statistics.xml
 .idea/**/dictionaries
