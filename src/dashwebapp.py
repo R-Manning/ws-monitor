@@ -6,19 +6,16 @@ import sqlite3
 import math
 from collections import deque
 from contextlib import closing
-from typing import Tuple
+from typing import Tuple, List, Dict, Any, Optional
 
 from dotenv import load_dotenv
 from pathlib import Path
 
 env_path = Path(__file__).resolve().parents[1] / ".env"
-if not env_path.exists():
-    raise RuntimeError(f".env file not found at {env_path}")
-load_dotenv(env_path)
+if env_path.exists():
+    load_dotenv(env_path)
 
 import cv2
-import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import signal, sys
 
@@ -27,6 +24,8 @@ from dash import Dash, dash_table, dcc, html, Input, Output
 from dash.dependencies import ClientsideFunction
 from flask import Response
 from paths import get_db_path
+from database import connect, initialize
+from metrics import get_metrics
 from threading import Lock, Timer
 
 
@@ -44,6 +43,8 @@ IDLE_GRACE_S = 10  # wait this long after last viewer disconnects before stoppin
 # Configuration
 # ──────────────────────────────────────────────────────────────────────────────
 DB_PATH = str(get_db_path())
+with connect(DB_PATH) as _conn:
+    initialize(_conn)
 
 DATA_TABLE = "stove_room"
 SETTINGS_TABLE = "settings"
@@ -55,8 +56,8 @@ DATA_COLS = ["datetime", "flueF", "sttF", "tempF", "humid"]
 # Example Wyze RTSP URL pattern (adjust for your camera):
 # rtsp://username:password@CAMERA_IP/live
 RTSP_URL = os.getenv("WYZE_RTSP_URL")
-if not RTSP_URL:
-    raise RuntimeError("WYZE_RTSP_URL missing in environment")
+CAMERA_ENABLED = os.getenv("WSM_CAMERA_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+CAMERA_ENABLED = CAMERA_ENABLED and bool(RTSP_URL)
 
 # Throttle the capture frame rate (processing + bandwidth saver)
 TARGET_FPS = float(os.getenv("TARGET_FPS", "5"))  # frames per second
@@ -72,71 +73,53 @@ capture_thread = None
 stop_event = threading.Event()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DB helpers
+# Settings cache (re-reads DB at most once per minute)
 # ──────────────────────────────────────────────────────────────────────────────
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
-    conn.row_factory = sqlite3.Row
-    # Small read perf bump and concurrency safety
-    with closing(conn.cursor()) as cur:
-        cur.execute("PRAGMA journal_mode=WAL;")
-        cur.execute("PRAGMA synchronous=NORMAL;")
-    return conn
+_settings_cache: Optional[Tuple[float, Tuple[int, int]]] = None
+_SETTINGS_CACHE_TTL = 60.0
 
 
-def get_settings() -> Tuple[int, int]:
-    """
-    Returns:
-        sample_period_s (int): seconds between samples  (column index 0)
-        rate_window_s  (int): window in seconds for rate calc (column index 3)
-    """
-    with closing(_connect()) as conn, closing(conn.cursor()) as cur:
-        cur.execute(f"SELECT * FROM {SETTINGS_TABLE} LIMIT 1;")
-        row = cur.fetchone()
-        if row is None:
-            # Safe defaults if settings table is empty
-            return 5, 60
-
-        # Access by POSITION (like your original iloc usage)
-        # Guard against short schemas with sensible default fallbacks.
-        sample_period_s = int(row[0])  # was dfSettings.iloc[0, 0]
-        rate_window_s = int(row[3]) if len(row) >= 4 else 60  # was dfSettings.iloc[0, 3]
-        return sample_period_s, rate_window_s
+def get_settings_cached() -> Tuple[int, int]:
+    """Return (sample_period_s, rate_window_s) from settings table, cached for 60s."""
+    global _settings_cache
+    now = time.monotonic()
+    if _settings_cache is not None:
+        cached_at, cached_val = _settings_cache
+        if now - cached_at < _SETTINGS_CACHE_TTL:
+            return cached_val
+    _settings_cache = (now, _get_settings_raw())
+    return _settings_cache[1]
 
 
-def get_recent_data(limit_rows: int) -> pd.DataFrame:
-    """
-    Fetch latest `limit_rows` records in *descending* order, then sort ascending
-    for plotting continuity. Handles empty DB safely.
-    """
-    query = (
-        f"SELECT {', '.join(DATA_COLS)} "
-        f"FROM {DATA_TABLE} ORDER BY datetime DESC LIMIT ?;"
-    )
-    with closing(_connect()) as conn:
-        df = pd.read_sql_query(query, conn, params=(int(limit_rows),))
-    if df.empty:
-        return df
-    # Ensure datetime is datetime dtype and sort ascending for a nice line chart
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
-    df = df.sort_values("datetime").reset_index(drop=True)
-    return df
+def _get_settings_raw() -> Tuple[int, int]:
+    with connect(DB_PATH) as conn:
+        initialize(conn)
+        row = conn.execute(f"SELECT * FROM {SETTINGS_TABLE} LIMIT 1;").fetchone()
+    if row is None:
+        return 5, 60
+    sample_period_s = int(row[0])
+    rate_window_s = int(row[3]) if len(row) >= 4 else 60
+    return sample_period_s, rate_window_s
 
 
-def get_downsampled(timeframe_minutes: int) -> pd.DataFrame:
-    """
-    Return AVG-downsampled data covering the full window (<= MAX_POINTS rows),
-    plus MIN/MAX columns for all series to draw bands.
+# ──────────────────────────────────────────────────────────────────────────────
+# Graph cache (avoids rebuilding Plotly figure every tick)
+# ──────────────────────────────────────────────────────────────────────────────
+_graph_cache: Optional[Tuple[Tuple, float, go.Figure]] = None
 
-    Columns:
-      datetime,
-      flueF,  flueF_min,  flueF_max,
-      sttF,   sttF_min,   sttF_max,
-      tempF,  tempF_min,  tempF_max,
-      humid,  humid_min,  humid_max
-    """
+
+def _sql_rows(sql: str, params: tuple) -> List[Dict[str, Any]]:
+    """Run a read query and return a list of dicts (replaces pandas.read_sql_query)."""
+    with connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        initialize(conn)
+        return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def get_downsampled(timeframe_minutes: int) -> List[Dict[str, Any]]:
+    """AVG-downsampled data covering the full window (<= MAX_POINTS rows)."""
     window_s = max(60, int(timeframe_minutes) * 60)
-    sample_period_s, _ = get_settings()
+    sample_period_s, _ = get_settings_cached()
     sample_period_s = max(1, int(sample_period_s))
     bucket_s = max(sample_period_s, math.ceil(window_s / MAX_POINTS))
 
@@ -153,35 +136,14 @@ def get_downsampled(timeframe_minutes: int) -> pd.DataFrame:
         FROM windowed
     )
     SELECT
-        bucket_epoch                 AS t_epoch,
-        AVG(flueF)                   AS flueF,
-        MIN(flueF)                   AS flueF_min,
-        MAX(flueF)                   AS flueF_max,
-        AVG(sttF)                    AS sttF,
-        MIN(sttF)                    AS sttF_min,
-        MAX(sttF)                    AS sttF_max,
-        AVG(tempF)                   AS tempF,
-        MIN(tempF)                   AS tempF_min,
-        MAX(tempF)                   AS tempF_max,
-        AVG(humid)                   AS humid,
-        MIN(humid)                   AS humid_min,
-        MAX(humid)                   AS humid_max
+        bucket_epoch AS t_epoch,
+        AVG(flueF) AS flueF, AVG(sttF) AS sttF,
+        AVG(tempF) AS tempF, AVG(humid) AS humid
     FROM bucketed
     GROUP BY bucket_epoch
     ORDER BY bucket_epoch ASC;
     """
-    params = (f"-{int(timeframe_minutes)} minutes", bucket_s, bucket_s)
-
-    with closing(_connect()) as conn:
-        df = pd.read_sql_query(sql, conn, params=params)
-
-    if df.empty:
-        return df
-
-    # Fast epoch -> datetime conversion
-    df["datetime"] = pd.to_datetime(df["t_epoch"], unit="s")
-    df.drop(columns=["t_epoch"], inplace=True)
-    return df
+    return _sql_rows(sql, (f"-{int(timeframe_minutes)} minutes", bucket_s, bucket_s))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -189,10 +151,49 @@ def get_downsampled(timeframe_minutes: int) -> pd.DataFrame:
 # ──────────────────────────────────────────────────────────────────────────────
 import plotly.io as pio
 
-def update_graph(timeframe_minutes=360, compact=True):
-    df = get_downsampled(timeframe_minutes)
+# Precompute colorway once (avoids template lookup on every tick)
+_COLORWAY = pio.templates["plotly_dark"].layout.colorway or [
+    "#636EFA", "#EF553B", "#00CC96", "#AB63FA"
+]
 
-    if df.empty:
+_SERIES = ["flueF", "sttF", "tempF", "humid"]
+_DISPLAY_NAMES = {"flueF": "Flue", "sttF": "STT", "tempF": "Room", "humid": "Humidity"}
+_COLOR_MAP = {var: _COLORWAY[i % len(_COLORWAY)] for i, var in enumerate(_SERIES)}
+
+
+def _rgba_from_hex(h: str, a: float) -> str:
+    h = h.strip()
+    if h.startswith("#") and len(h) == 7:
+        r = int(h[1:3], 16); g = int(h[3:5], 16); b = int(h[5:7], 16)
+        return f"rgba({r},{g},{b},{a})"
+    if h.startswith("rgba("):
+        base = h[:h.rfind(",")]
+        return f"{base}, {a})"
+    if h.startswith("rgb("):
+        return h.replace("rgb(", "rgba(").replace(")", f", {a})")
+    return f"rgba(255,255,255,{a})"
+
+
+def update_graph(timeframe_minutes: int = 360, compact: bool = True) -> go.Figure:
+    """Build chart figure, served from cache when inputs haven't changed."""
+    global _graph_cache
+    now = time.monotonic()
+    cache_key = (timeframe_minutes, compact)
+
+    if _graph_cache is not None:
+        prev_key, prev_time, prev_fig = _graph_cache
+        if prev_key == cache_key and (now - prev_time) < 30.0:
+            return prev_fig
+
+    fig = _build_figure(timeframe_minutes, compact)
+    _graph_cache = (cache_key, now, fig)
+    return fig
+
+
+def _build_figure(timeframe_minutes: int, compact: bool) -> go.Figure:
+    rows = get_downsampled(timeframe_minutes)
+
+    if not rows:
         fig = go.Figure()
         fig.add_annotation(
             x=0.5, y=0.5, text="Waiting for data...", showarrow=False,
@@ -202,65 +203,18 @@ def update_graph(timeframe_minutes=360, compact=True):
                           margin=dict(l=8, r=8, t=8, b=8))
         return fig
 
-    # Fixed series order + human-friendly legend labels
-    series = ["flueF", "sttF", "tempF", "humid"]
-    DISPLAY_NAMES = {
-        "flueF": "Flue",
-        "sttF":  "STT",
-        "tempF": "Room",
-        "humid": "Humidity",
-    }
-
-    # Pull colors from the plotly_dark template colorway
-    colorway = pio.templates["plotly_dark"].layout.colorway
-    if not colorway:
-        colorway = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA"]
-    COLOR_MAP = {var: colorway[i % len(colorway)] for i, var in enumerate(series)}
-
-    def rgba_from_hex(h, a):
-        h = h.strip()
-        if h.startswith("#") and len(h) == 7:
-            r = int(h[1:3], 16); g = int(h[3:5], 16); b = int(h[5:7], 16)
-            return f"rgba({r},{g},{b},{a})"
-        if h.startswith("rgba("):
-            base = h[:h.rfind(",")]
-            return f"{base}, {a})"
-        if h.startswith("rgb("):
-            return h.replace("rgb(", "rgba(").replace(")", f", {a})")
-        return f"rgba(255,255,255,{a})"
-
+    datetimes = [r["datetime"] for r in rows]
     fig = go.Figure()
 
-    # Bands first (so lines on top, no legend entries)
-    for var in series:
-        min_col, max_col = f"{var}_min", f"{var}_max"
-        if min_col in df.columns and max_col in df.columns:
-            c = COLOR_MAP[var]
-            fig.add_trace(go.Scatter(
-                x=df["datetime"], y=df[max_col],
-                mode="lines", line=dict(width=0),
-                showlegend=False, hoverinfo="skip",
-                legendgroup=var
-            ))
-            fig.add_trace(go.Scatter(
-                x=df["datetime"], y=df[min_col],
-                mode="lines", line=dict(width=0),
-                fill="tonexty", fillcolor=rgba_from_hex(c, 0.2),
-                showlegend=False, hoverinfo="skip",
-                legendgroup=var
-            ))
-
-    # Main lines with explicit colors + friendly legend names
-    for var in series:
+    # Main lines only (4 traces instead of 12 — no min/max bands)
+    for var in _SERIES:
         fig.add_trace(go.Scatter(
-            x=df["datetime"], y=df[var],
+            x=datetimes, y=[r[var] for r in rows],
             mode="lines",
-            name=DISPLAY_NAMES.get(var, var),  # change legend text here
-            line=dict(color=COLOR_MAP[var], width=2),
-            legendgroup=var
+            name=_DISPLAY_NAMES.get(var, var),
+            line=dict(color=_COLOR_MAP[var], width=2),
         ))
 
-    # Layout — legend centered BELOW the x-axis title
     fig.update_layout(
         template="plotly_dark",
         hovermode="x unified",
@@ -270,8 +224,7 @@ def update_graph(timeframe_minutes=360, compact=True):
         legend=dict(
             orientation="h",
             x=0.5, xanchor="center",
-            y=-0.1 if compact else -0.25,  # pushes below x-axis area
-            groupclick="togglegroup"
+            y=-0.1 if compact else -0.25,
         )
     )
 
@@ -290,51 +243,15 @@ def update_graph(timeframe_minutes=360, compact=True):
     return fig
 
 
-
-
-
-
-
-
 def update_metrics() -> list[dict]:
-    sample_period_s, rate_window_s = get_settings()
-    # rows covering the rate window
-    rows_needed = max(2, int(rate_window_s / max(1, sample_period_s)))
-    df = get_recent_data(rows_needed)
+    """Return current values and rate/min rows without pandas."""
+    rows = get_metrics(DB_PATH)
+    return [
+        {key: ("Unavailable" if value is None else value) for key, value in row.items()}
+        for row in rows
+    ]
 
-    if df.empty:
-        # Provide a placeholder row so the DataTable renders
-        metrics = pd.DataFrame(
-            [
-                ["Current Values", None, None, None, None],
-                ["Rate/minute", None, None, None, None],
-            ],
-            columns=["Data-Type", "Flue (F)", "STT (F)", "Room (F)", "Humidity (%)"],
-        )
-        return metrics.to_dict("records")
 
-    # newestData: last row (most recent after ascending sort)
-    newest = df.tail(1)[["flueF", "sttF", "tempF", "humid"]].reset_index(drop=True)
-    # minOldData: oldest row inside the window
-    oldest = df.head(1)[["flueF", "sttF", "tempF", "humid"]].reset_index(drop=True)
-
-    # compute per-minute deltas based on actual elapsed minutes to be robust
-    elapsed_seconds = (
-        (df["datetime"].iloc[-1] - df["datetime"].iloc[0]).total_seconds()
-        if len(df) > 1
-        else max(1, sample_period_s)
-    )
-    elapsed_minutes = max(1e-9, elapsed_seconds / 60.0)  # avoid divide by zero
-
-    deltas_per_min = (newest - oldest) / elapsed_minutes
-
-    metrics = pd.concat([newest, deltas_per_min], ignore_index=True)
-    metrics.columns = ["Flue (F)", "STT (F)", "Room (F)", "Humidity (%)"]
-    metrics = metrics.round(1)
-    metrics.insert(0, "Data-Type", ["Current Values", "Rate/minute"], True)
-    return metrics.to_dict("records")
-    
-    
 #CAMERA
 
 def _open_capture():
@@ -388,6 +305,8 @@ def capture_loop():
 def _ensure_capture_running():
     """Start the capture thread if it's not already running."""
     global capture_thread, stop_event
+    if not CAMERA_ENABLED:
+        return
     if capture_thread is None or not capture_thread.is_alive():
         stop_event.clear()
         capture_thread = threading.Thread(target=capture_loop, name="RTSPCapture", daemon=True)
@@ -487,20 +406,19 @@ def mjpeg_generator():
                 _schedule_stop_if_idle()
 
 
-
-
-_initial_sample_period_s, _ = get_settings()
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Dash App
 # ──────────────────────────────────────────────────────────────────────────────
 
-app = Dash(__name__, title="Wood Stove Monitor", update_title=None)
+app = Dash(__name__, title="Wood Stove Monitor", update_title=None,
+           suppress_callback_exceptions=True)
 server = app.server  # <-- get the Flask app from Dash
 
 @server.route("/video.mjpg")
 def video_feed():
     # Chrome happily plays MJPEG via multipart/x-mixed-replace
+    if not CAMERA_ENABLED:
+        return Response("Camera unavailable", status=503, mimetype="text/plain")
     return Response(
         mjpeg_generator(),
         mimetype="multipart/x-mixed-replace; boundary=frame",
@@ -870,7 +788,7 @@ app.layout = dmc.MantineProvider(
                # Interval is set dynamically from settings via callback below
                 dcc.Interval(
                     id="interval-component",
-                    interval=_initial_sample_period_s * 1000,
+                    interval=_get_settings_raw()[0] * 1000,
                     n_intervals=0,
                 ),
                 dcc.Store(id="ui-flags", data={"compact": False}, storage_type="memory"),
@@ -976,7 +894,7 @@ def refresh_interval(_n):
     Re-read settings periodically so changes on-disk (sample period)
     propagate without restarting the app.
     """
-    sample_period_s, _ = get_settings()
+    sample_period_s, _ = get_settings_cached()
     return max(1, int(sample_period_s)) * 1000
     
     
