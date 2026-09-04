@@ -23,7 +23,7 @@ provides real-time visualization and historical analysis.
 - **Table View**: Displays the most recent values and 60-minute deltas.
   - Cells are highlighted based on acceptable value ranges.
 - **Graph View**: Shows historical trends with selectable timeframes.
-- **Video Stream**: Embeds an RTSP feed of the stove (via OpenCV / MJPEG).
+- **Video Stream**: Embeds an RTSP feed of the stove (via WebRTC low-latency H.264 relay, no server-side transcoding).
 
 ### Alerts
 - Utilize a telegram bot to send notifications to a phone based on acceptable
@@ -39,6 +39,10 @@ The dependency files are split by role:
 python3 -m venv .venv
 python3 -m pip install -r requirements/dev.txt
 ```
+
+Python 3.10 or newer is required for `requirements/dashboard.txt` (aiortc).
+On macOS, use `brew install python@3.12` (or `uv venv --python 3.12` if
+using `uv`) before creating the virtual environment.
 
 `requirements/base.txt` is sufficient for the collector, diagnostics, and
 watchdog. Install `requirements/pi.txt` on a Raspberry Pi for the sensor
@@ -63,7 +67,7 @@ WSM_DB_PATH="$PWD/runtime/house_environment.db" \
 
 Use `--once` for a single sample. Set `WSM_CAMERA_ENABLED=false` in `.env` on
 macOS unless an RTSP camera is available. The dashboard is optional; the
-collector, database, metrics, and tests do not require Dash, pandas, OpenCV,
+collector, database, metrics, and tests do not require Dash, pandas, aiortc,
 or Raspberry Pi packages.
 
 ## Raspberry Pi Services
@@ -88,6 +92,40 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now ws-monitor-collector.service
 sudo systemctl enable --now ws-monitor-dashboard.service
 ```
+
+### Resilience and automatic recovery
+
+The dashboard service is hardened against three failure modes:
+
+1. **Process crash** — `Restart=always` + `RestartSec=3` in the unit file makes
+   systemd relaunch it immediately, and `TimeoutStopSec=10` forces a fast
+   `SIGKILL` if a shutdown ever hangs.
+
+2. **Process hang (alive but unresponsive)** — the app exposes a lightweight
+   liveness endpoint `GET /_healthz` (returns 200 whenever Flask can serve).
+   The optional `dashweb-watchdog.service` polls it every 15 s and runs
+   `systemctl restart dashweb.service` after 3 consecutive failures (min 90 s
+   between restarts to avoid thrash):
+
+   ```sh
+   sudo install -m 0755 deploy/scripts/dashweb_watchdog.sh /usr/local/sbin/dashweb_watchdog.sh
+   sudo install -m 0644 deploy/systemd/dashweb-watchdog.service.template /etc/systemd/system/dashweb-watchdog.service
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now dashweb-watchdog.service
+   ```
+
+   Watchdog activity is logged under the `dashweb-watchdog` journal tag; the
+   app logs `WEBRTC:` lines for in-process restarts.
+
+3. **Camera/RTSP outage or abandoned signaling** — inside the WebRTC loop the
+   app runs two background coroutines:
+   - `_monitor_player_health()` subscribes a probe track to the relay every
+     10 s; if no frame arrives within 5 s across 2 consecutive checks it
+     recreates the player/relay in-place (browsers reconnect within ~3 s).
+   - `_sweep_stale_peers()` expires unanswered offers (30 s) and peer
+     connections stuck in `new`/`connecting` (60 s), preventing orphaned
+     peer objects from accumulating (the "no video after a stray offer"
+     failure mode).
 
 Alerting runs inside the collector after each committed sample. Missing Telegram
 credentials or delivery failures will not stop collection.
