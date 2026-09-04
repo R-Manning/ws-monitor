@@ -51,6 +51,7 @@ with connect(DB_PATH) as _conn:
 DATA_TABLE = "stove_room"
 SETTINGS_TABLE = "settings"
 MAX_POINTS = 5000
+GRAPH_INTERVAL_S = 15
 
 # Column order we expect from stove_room for plotting/metrics
 DATA_COLS = ["datetime", "flueF", "sttF", "tempF", "humid"]
@@ -195,7 +196,7 @@ def update_graph(timeframe_minutes: int = 360, compact: bool = True) -> go.Figur
 
     if _graph_cache is not None:
         prev_key, prev_time, prev_fig = _graph_cache
-        if prev_key == cache_key and (now - prev_time) < 30.0:
+        if prev_key == cache_key and (now - prev_time) < GRAPH_INTERVAL_S:
             return prev_fig
 
     fig = _build_figure(timeframe_minutes, compact)
@@ -1015,6 +1016,11 @@ app.layout = dmc.MantineProvider(
                     interval=_get_settings_raw()[0] * 1000,
                     n_intervals=0,
                 ),
+                dcc.Interval(
+                    id="graph-interval",
+                    interval=GRAPH_INTERVAL_S * 1000,
+                    n_intervals=0,
+                ),
                 dcc.Store(id="ui-flags", data={"compact": False}, storage_type="memory"),
                 dcc.Interval(id="ui-detect", interval=300, n_intervals=0, max_intervals=1),
             ],
@@ -1070,7 +1076,7 @@ def metrics_columns(ui_flags):
 
 @app.callback(
     Output("graph", "figure"),
-    Input("interval-component", "n_intervals"),
+    Input("graph-interval", "n_intervals"),
     Input("timeframe-dropdown", "value"),
     Input("ui-flags", "data"),
 )
