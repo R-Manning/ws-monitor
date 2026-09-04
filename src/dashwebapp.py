@@ -4,7 +4,11 @@ import time
 import threading
 import sqlite3
 import math
-from collections import deque
+import re
+import json
+import asyncio
+import traceback
+import uuid
 from contextlib import closing
 from typing import Tuple, List, Dict, Any, Optional
 
@@ -15,28 +19,26 @@ env_path = Path(__file__).resolve().parents[1] / ".env"
 if env_path.exists():
     load_dotenv(env_path)
 
-import cv2
-import plotly.graph_objects as go
 import signal, sys
+import plotly.graph_objects as go
 
 import dash_mantine_components as dmc
 from dash import Dash, dash_table, dcc, html, Input, Output
 from dash.dependencies import ClientsideFunction
-from flask import Response
+from flask import Response, request
 from paths import get_db_path
 from database import connect, initialize
 from metrics import get_metrics
 from threading import Lock, Timer
 
+from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc.contrib.media import MediaPlayer, MediaRelay
 
-cv2.setNumThreads(1)
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
-
-# Track viewers and manage the capture thread lazily
+# Track viewers and manage the WebRTC session lazily
 active_viewers = 0
 _viewers_lock = Lock()
 _idle_stop_timer = None
-IDLE_GRACE_S = 10  # wait this long after last viewer disconnects before stopping capture
+IDLE_GRACE_S = 10  # wait this long after last viewer disconnects before stopping the stream
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -59,18 +61,29 @@ RTSP_URL = os.getenv("WYZE_RTSP_URL")
 CAMERA_ENABLED = os.getenv("WSM_CAMERA_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 CAMERA_ENABLED = CAMERA_ENABLED and bool(RTSP_URL)
 
-# Throttle the capture frame rate (processing + bandwidth saver)
-TARGET_FPS = float(os.getenv("TARGET_FPS", "5"))  # frames per second
 RECONNECT_DELAY_S = float(os.getenv("RECONNECT_DELAY_S", "3"))
-JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "50"))  # 0-100
-FRAME_BUFFER_SIZE = int(os.getenv("FRAME_BUFFER_SIZE", "1"))  # keep latest N frames
 
 # =========================
-# Shared state
+# WebRTC shared state
 # =========================
-latest_frames = deque(maxlen=FRAME_BUFFER_SIZE)  # store the most recent frames (BGR np.array)
-capture_thread = None
-stop_event = threading.Event()
+_webrtc_player = None       # aiortc MediaPlayer — single RTSP connection
+_webrtc_relay = None        # aiortc MediaRelay — fan-out to multiple viewers
+_webrtc_lock = Lock()
+_webrtc_loop = None         # asyncio event loop for aiortc
+_webrtc_thread = None       # daemon thread running the event loop
+_active_peer_connections = set()
+_pending_peer_connections = {}
+_pc_started: Dict[int, float] = {}       # id(pc) -> creation time, for stale cleanup
+
+# Hanging-chad / stale-connection protection
+PENDING_PEER_TTL_S = 30.0    # offer handed out but browser never answered
+STUCK_PEER_TTL_S = 60.0      # PC stuck in new/connecting this long gets closed
+SWEEP_INTERVAL_S = 15.0
+
+# Camera self-heal
+HEALTH_CHECK_INTERVAL_S = 10.0
+HEALTH_RECV_TIMEOUT_S = 5.0
+HEALTH_MAX_MISSES = 2
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Settings cache (re-reads DB at most once per minute)
@@ -252,65 +265,86 @@ def update_metrics() -> list[dict]:
     ]
 
 
-#CAMERA
+# ──────────────────────────────────────────────────────────────────────────────
+# WebRTC camera pipeline
+# ──────────────────────────────────────────────────────────────────────────────
 
-def _open_capture():
-    # Tell FFmpeg/OpenCV to be conservative
-    # You can also export OPENCV_FFMPEG_CAPTURE_OPTIONS env var if desired.
-    cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # tiny buffer
-    # Request smaller decode size if your cam supports stream params; often ignored:
-    # cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
-    return cap
+def _ensure_webrtc_running():
+    """Start the RTSP MediaPlayer and asyncio loop on first viewer."""
+    global _webrtc_player, _webrtc_relay, _webrtc_loop, _webrtc_thread
 
-def capture_loop():
-    """Read RTSP, but only *decode* the frames we intend to show."""
-    global latest_frames
-    target_fps = max(0.5, TARGET_FPS)
-    frame_interval = 1.0 / target_fps
-    reconnect = max(0.5, RECONNECT_DELAY_S)
+    with _webrtc_lock:
+        if _webrtc_player is not None:
+            return
 
-    while not stop_event.is_set():
-        cap = _open_capture()
-        if not cap.isOpened():
-            time.sleep(reconnect)
-            continue
+        # If a camera restart is in flight on an existing loop, wait briefly
+        # for the fresh player instead of spawning a second loop.
+        if _webrtc_loop is not None:
+            for _ in range(20):
+                if _webrtc_player is not None:
+                    return
+                time.sleep(0.1)
 
-        next_keep = time.time()
-        # Use grab/retrieve to avoid decoding every frame
-        while not stop_event.is_set():
-            grabbed = cap.grab()
-            if not grabbed:
-                break  # lost stream; reconnect
+        # Start asyncio event loop FIRST — MediaPlayer.__init__ captures
+        # asyncio.get_event_loop() internally, so the loop must already be
+        # running in the thread context where the player is created.
+        _webrtc_loop = asyncio.new_event_loop()
 
-            now = time.time()
-            # Only decode + process at the cadence we really want
-            if now >= next_keep:
-                ok, frame = cap.retrieve()  # decode only here
-                if not ok or frame is None:
-                    break
-                # Downscale aggressively before JPEG
-                frame = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
-                latest_frames.append(frame)
-                next_keep += frame_interval
+        def _run_loop():
+            asyncio.set_event_loop(_webrtc_loop)
+            _webrtc_loop.run_forever()
 
-            # Tiny sleep to avoid hot looping when source FPS is high
-            time.sleep(0.002)
+        _webrtc_thread = threading.Thread(target=_run_loop, daemon=True)
+        _webrtc_thread.start()
 
-        cap.release()
-        time.sleep(reconnect)
-        
+        # Create MediaPlayer on the running loop so its internal worker
+        # thread gets the correct event loop for packet delivery.
+        async def _init_player():
+            global _webrtc_player, _webrtc_relay
+            _webrtc_player = MediaPlayer(RTSP_URL, decode=False)
+            _webrtc_relay = MediaRelay()
 
-def _ensure_capture_running():
-    """Start the capture thread if it's not already running."""
-    global capture_thread, stop_event
-    if not CAMERA_ENABLED:
-        return
-    if capture_thread is None or not capture_thread.is_alive():
-        stop_event.clear()
-        capture_thread = threading.Thread(target=capture_loop, name="RTSPCapture", daemon=True)
-        capture_thread.start()
+        future = asyncio.run_coroutine_threadsafe(_init_player(), _webrtc_loop)
+        future.result(timeout=15)
+
+        # Launch camera-health monitor + stale-peer sweeper on the loop.
+        _webrtc_loop.call_soon_threadsafe(_start_supervisors)
+
+
+def _teardown_webrtc():
+    """Close the RTSP player and event loop when no viewers remain."""
+    global _webrtc_player, _webrtc_relay, _webrtc_loop, _webrtc_thread
+
+    with _webrtc_lock:
+        if _webrtc_player is None:
+            return
+
+        loop = _webrtc_loop
+        thread = _webrtc_thread
+
+        # Close all active peer connections
+        for pc in list(_active_peer_connections):
+            try:
+                future = asyncio.run_coroutine_threadsafe(pc.close(), loop)
+                future.result(timeout=5)
+            except Exception:
+                pass
+        _active_peer_connections.clear()
+        _pc_started.clear()
+        _pending_peer_connections.clear()
+
+        # Stop the event loop (this tears down MediaPlayer tracks)
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
+        except Exception:
+            pass
+
+        # Null out references — GC handles MediaPlayer/Relay cleanup
+        _webrtc_player = None
+        _webrtc_relay = None
+        _webrtc_loop = None
+        _webrtc_thread = None
 
 
 def _schedule_stop_if_idle():
@@ -324,111 +358,299 @@ def _schedule_stop_if_idle():
         _idle_stop_timer = None
 
     def _maybe_stop():
-        global capture_thread
         with _viewers_lock:
             if active_viewers == 0:
-                # No viewers—stop capture
-                stop_event.set()
-                # Join quickly to release the camera/decoder
-                if capture_thread and capture_thread.is_alive():
-                    capture_thread.join(timeout=3)
-                capture_thread = None    
-                
+                _teardown_webrtc()
+
     _idle_stop_timer = Timer(IDLE_GRACE_S, _maybe_stop)
     _idle_stop_timer.daemon = True
     _idle_stop_timer.start()
 
 
-def mjpeg_generator():
-    """
-    Throttled MJPEG generator that:
-      - Starts capture on first viewer (handled by caller before yielding)
-      - Encodes at most TARGET_FPS frames/sec
-      - Reads the latest frame with race-safe guards
-      - Schedules capture stop after last viewer disconnects
-    """
-    global active_viewers
-
-    # Mark viewer connected
-    with _viewers_lock:
-        active_viewers += 1
-        _ensure_capture_running()   # cancel pending stop & ensure capture is running
-
-    try:
-        # Wait for first frame to arrive
-        while not latest_frames and not stop_event.is_set():
-            time.sleep(0.05)
-
-        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(JPEG_QUALITY)]
-        min_interval = 1.0 / max(0.5, float(TARGET_FPS))
-        last_sent = 0.0
-
-        # Stream until the client disconnects
-        while not stop_event.is_set():
-            # --- race-safe read of newest frame ---
-            frame = None
-            if latest_frames:
-                try:
-                    frame = latest_frames[-1]  # could raise if deque shrinks between check and read
-                except IndexError:
-                    frame = None
-
-            if frame is None:
-                time.sleep(0.02)
-                continue
-
-            # --- throttle send rate ---
-            now = time.time()
-            remaining = min_interval - (now - last_sent)
-            if remaining > 0:
-                time.sleep(min(remaining, 0.02))
-                continue
-
-            ok, jpeg = cv2.imencode(".jpg", frame, encode_params)
-            if not ok:
-                time.sleep(0.01)
-                continue
-
-            last_sent = time.time()
-            bytes_ = jpeg.tobytes()
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n"
-                b"Content-Length: " + str(len(bytes_)).encode() + b"\r\n\r\n" +
-                bytes_ + b"\r\n"
-            )
-
-    finally:
-        # Client disconnected; decrement and maybe stop capture
-        with _viewers_lock:
-            active_viewers = max(0, active_viewers - 1)
-            if active_viewers == 0:
-                _schedule_stop_if_idle()
+def _cancel_pending_stop():
+    """Cancel any scheduled idle stop (a new viewer arrived)."""
+    global _idle_stop_timer
+    if _idle_stop_timer is not None:
+        try:
+            _idle_stop_timer.cancel()
+        except Exception:
+            pass
+        _idle_stop_timer = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Dash App
+# WebRTC supervisors (camera self-heal + stale-connection cleanup)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _start_supervisors():
+    """Launch background coroutines on the WebRTC loop (runs on the loop)."""
+
+    async def _launch():
+        asyncio.create_task(_monitor_player_health())
+        asyncio.create_task(_sweep_stale_peers())
+
+    asyncio.ensure_future(_launch())
+
+
+async def _restart_player():
+    """Drop stale peer connections and recreate relay/player in-place.
+
+    Runs on the WebRTC loop; browsers retry within ~3s and get a fresh relay.
+    """
+    global _webrtc_player, _webrtc_relay
+
+    for pc in list(_active_peer_connections):
+        try:
+            await pc.close()
+        except Exception:
+            pass
+    _active_peer_connections.clear()
+    _pc_started.clear()
+    _pending_peer_connections.clear()
+
+    try:
+        if _webrtc_player is not None:
+            await _webrtc_player.stop()
+    except Exception:
+        pass
+    try:
+        if _webrtc_relay is not None:
+            await _webrtc_relay.stop()
+    except Exception:
+        pass
+
+    _webrtc_relay = MediaRelay()
+    try:
+        _webrtc_player = MediaPlayer(RTSP_URL, decode=False)
+    except Exception as exc:
+        print(f"WEBRTC: player restart failed: {exc}", flush=True)
+        _webrtc_player = None
+
+
+async def _monitor_player_health():
+    """Periodically verify the camera is producing frames and restart the
+    pipeline in-place if it has stalled."""
+    misses = 0
+    while True:
+        await asyncio.sleep(HEALTH_CHECK_INTERVAL_S)
+        player = _webrtc_player
+        relay = _webrtc_relay
+        if player is None or relay is None or player.video is None:
+            continue
+        probe = None
+        try:
+            probe = relay.subscribe(player.video)
+            await asyncio.wait_for(probe.recv(), timeout=HEALTH_RECV_TIMEOUT_S)
+            misses = 0
+        except Exception:
+            misses += 1
+        finally:
+            if probe is not None:
+                try:
+                    probe.stop()
+                except Exception:
+                    pass
+        if misses >= HEALTH_MAX_MISSES:
+            print("WEBRTC: camera pipeline stalled; restarting player", flush=True)
+            await _restart_player()
+            misses = 0
+
+
+async def _sweep_stale_peers():
+    """Close orphaned / half-open peer connections (hanging-chad guard).
+
+    Handles two leaks: offered PCs the browser never answered, and active PCs
+    stuck in new/connecting that can never reach a usable state on their own.
+    """
+    while True:
+        await asyncio.sleep(SWEEP_INTERVAL_S)
+        now = time.time()
+
+        # Unanswered offers (signaling abandoned mid-handshake)
+        for pc_id in list(_pending_peer_connections):
+            entry = _pending_peer_connections.get(pc_id)
+            if entry is None:
+                continue
+            pc, ts = entry
+            if now - ts > PENDING_PEER_TTL_S:
+                _pending_peer_connections.pop(pc_id, None)
+                _active_peer_connections.discard(pc)
+                _pc_started.pop(id(pc), None)
+                try:
+                    await pc.close()
+                except Exception:
+                    pass
+
+        # Active PCs stuck before they ever connected
+        for pc in list(_active_peer_connections):
+            if pc.connectionState in ("new", "connecting"):
+                ts = _pc_started.get(id(pc))
+                if ts is not None and now - ts > STUCK_PEER_TTL_S:
+                    _active_peer_connections.discard(pc)
+                    _pc_started.pop(id(pc), None)
+                    try:
+                        await pc.close()
+                    except Exception:
+                        pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dash App & WebRTC signaling
 # ──────────────────────────────────────────────────────────────────────────────
 
 app = Dash(__name__, title="Wood Stove Monitor", update_title=None,
            suppress_callback_exceptions=True)
 server = app.server  # <-- get the Flask app from Dash
 
-@server.route("/video.mjpg")
-def video_feed():
-    # Chrome happily plays MJPEG via multipart/x-mixed-replace
+
+@server.route("/webrtc/offer", methods=["GET"])
+def webrtc_offer():
+    """Server-initiated: create a PC with a video track, return an SDP offer."""
     if not CAMERA_ENABLED:
         return Response("Camera unavailable", status=503, mimetype="text/plain")
-    return Response(
-        mjpeg_generator(),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
+
+    try:
+        _ensure_webrtc_running()
+    except Exception as e:
+        return Response(f"Camera connection failed: {e}", status=503)
+
+    async def _handle():
+        global active_viewers
+        pc = RTCPeerConnection()
+        _active_peer_connections.add(pc)
+        _pc_started[id(pc)] = time.time()
+
+        @pc.on("connectionstatechange")
+        async def on_connectionstatechange():
+            global active_viewers
+            if pc.connectionState in ("failed", "closed", "disconnected"):
+                _active_peer_connections.discard(pc)
+                _pc_started.pop(id(pc), None)
+                with _viewers_lock:
+                    active_viewers = max(0, active_viewers - 1)
+                    if active_viewers == 0:
+                        _schedule_stop_if_idle()
+                try:
+                    await pc.close()
+                except Exception:
+                    pass
+
+        with _webrtc_lock:
+            if _webrtc_relay is None or _webrtc_player is None:
+                await pc.close()
+                return {"error": "Camera not ready"}
+            pc.addTrack(_webrtc_relay.subscribe(_webrtc_player.video))
+
+        offer = await pc.createOffer()
+
+        # Strip VP8 from the SDP offer before setting it, so Chrome is
+        # forced to pick H.264. Chrome always prefers VP8, but our raw
+        # H.264 packets won't decode under a VP8 codec — every frame
+        # gets dropped.
+        sdp = offer.sdp
+        vp8_pt_match = re.search(r"a=rtpmap:(\d+) VP8/", sdp)
+        if vp8_pt_match:
+            vp8_pt = vp8_pt_match.group(1)
+            sdp = re.sub(rf"a=rtpmap:{vp8_pt} VP8/\d+\r\n", "", sdp)
+            sdp = re.sub(rf"a=rtcp-fb:{vp8_pt} [^\r]*\r\n", "", sdp)
+            sdp = re.sub(rf"a=fmtp:{vp8_pt}[^\r]*\r\n", "", sdp)
+            # Remove VP8's RTX payload type (VP8 + next PT is RTX by aiortc)
+            sdp = re.sub(rf"a=rtpmap:\d+ rtx/\d+\r\n.*?a=fmtp:\d+ apt={vp8_pt}\r\n",
+                         "", sdp, flags=re.DOTALL)
+            # Clean the m= line to only list H.264 payload types
+            remaining_pts = re.findall(r"a=rtpmap:(\d+) (H264|rtx)/", sdp)
+            pt_list = [pt for pt, _ in remaining_pts]
+            if pt_list:
+                sdp = re.sub(r"m=video \d+ UDP/TLS/RTP/SAVPF[^\r]*",
+                             f"m=video 0 UDP/TLS/RTP/SAVPF " + " ".join(pt_list), sdp)
+        offer.sdp = sdp
+
+        await pc.setLocalDescription(offer)
+
+        for _ in range(100):
+            if pc.iceGatheringState == "complete":
+                break
+            await asyncio.sleep(0.05)
+
+        # Store the PC so the answer endpoint can find it
+        pc_id = uuid.uuid4().hex
+        _pending_peer_connections[pc_id] = (pc, time.time())
+
+        # Mark viewer connected
+        with _viewers_lock:
+            active_viewers += 1
+            _cancel_pending_stop()
+
+        return {
+            "sdp": pc.localDescription.sdp,
+            "type": pc.localDescription.type,
+            "pc_id": pc_id,
         }
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(_handle(), _webrtc_loop)
+        result = future.result(timeout=10)
+    except Exception as e:
+        traceback.print_exc()
+        return Response(json.dumps({"error": str(e)}), status=500, mimetype="application/json")
+
+    return Response(
+        json.dumps(result),
+        mimetype="application/json",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
     )
 
+
+@server.route("/webrtc/answer", methods=["POST"])
+def webrtc_answer():
+    """Receive the browser's SDP answer to complete signaling."""
+    params = request.json
+    answer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+    pc_id = params.get("pc_id", "")
+
+    entry = _pending_peer_connections.pop(pc_id, None)
+    pc = entry[0] if entry else None
+    if pc is None:
+        return Response(json.dumps({"error": "Unknown PC"}), status=404, mimetype="application/json")
+
+    async def _handle():
+        await pc.setRemoteDescription(answer)
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(_handle(), _webrtc_loop)
+        future.result(timeout=5)
+    except Exception as e:
+        traceback.print_exc()
+        return Response(json.dumps({"error": str(e)}), status=500, mimetype="application/json")
+
+    return Response(
+        json.dumps({"ok": True}),
+        mimetype="application/json",
+    )
+
+
+@server.route("/_healthz", methods=["GET"])
+def healthz():
+    """Liveness probe for the external watchdog.
+
+    Returns 200 while Flask can serve requests at all; the state payload is
+    for humans/forensics, not gating.
+    """
+    return Response(
+        json.dumps({
+            "status": "ok",
+            "webrtc_player": _webrtc_player is not None,
+            "webrtc_loop_alive": bool(_webrtc_loop is not None and _webrtc_loop.is_running()),
+            "viewers": active_viewers,
+            "active_peers": len(_active_peer_connections),
+        }),
+        mimetype="application/json",
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dash App
+# ──────────────────────────────────────────────────────────────────────────────
 
 app.layout = dmc.MantineProvider(
     theme={"colorScheme": "dark"},
@@ -770,9 +992,11 @@ app.layout = dmc.MantineProvider(
                                         "border": "1px solid white",
                                         "overflow": "hidden",
                                     },
-                                    children=html.Img(
+                                    children=html.Video(
                                         id="video",
-                                        src="/video.mjpg",
+                                        autoPlay=True,
+                                        muted=True,
+                                        controls=False,
                                         draggable=False,
                                         style={"position": "absolute", "inset": 0, "width": "100%", "height": "100%", "objectFit": "contain"},
                                     ),
@@ -805,9 +1029,7 @@ def main():
         app.run(host="0.0.0.0", port=8050, debug=False)
     finally:
         # Ensure clean shutdown
-        stop_event.set()
-        if capture_thread and capture_thread.is_alive():
-            capture_thread.join(timeout=3)
+        _teardown_webrtc()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -899,11 +1121,9 @@ def refresh_interval(_n):
     
     
 def _shutdown(*_args):
-    """Handle SIGINT/SIGTERM: stop capture thread and exit cleanly."""
-    stop_event.set()
+    """Handle SIGINT/SIGTERM: tear down WebRTC and exit cleanly."""
     try:
-        if capture_thread and capture_thread.is_alive():
-            capture_thread.join(timeout=3)
+        _teardown_webrtc()
     except Exception:
         pass
     sys.exit(0)
