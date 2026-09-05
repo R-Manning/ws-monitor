@@ -40,6 +40,27 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(metrics[1]["Flue (F)"], 10.0)
             self.assertEqual(metrics[1]["Humidity (%)"], None)
 
+    def test_initialize_migrates_legacy_table_without_ok_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.db"
+            with sqlite3.connect(path) as conn:
+                conn.executescript("""
+                    CREATE TABLE stove_room (
+                        datetime TEXT PRIMARY KEY,
+                        tempF FLOAT, humid FLOAT, flueF FLOAT, sttF FLOAT
+                    );
+                    INSERT INTO stove_room VALUES ('2026-01-01 00:00:00', 70, NULL, 212, 80);
+                """)
+            with connect(path) as conn:
+                initialize(conn)
+                columns = [row[1] for row in conn.execute("PRAGMA table_info(stove_room)").fetchall()]
+                for col in ("tempF_ok", "humid_ok", "flueF_ok", "sttF_ok"):
+                    self.assertIn(col, columns)
+                row = conn.execute(
+                    "SELECT tempF_ok, humid_ok, flueF_ok, sttF_ok FROM stove_room"
+                ).fetchone()
+            self.assertEqual(row, (1, 0, 1, 1))
+
 
 class SensorTests(unittest.TestCase):
     def test_simulated_reader_requires_no_hardware_packages(self):

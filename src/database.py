@@ -19,6 +19,21 @@ def connect(path: Union[str, Path]) -> sqlite3.Connection:
     return conn
 
 
+def _ensure_ok_columns(conn: sqlite3.Connection) -> None:
+    """Add missing *_ok flag columns to an existing stove_room and backfill them."""
+    row = conn.execute("PRAGMA table_info(stove_room)").fetchall()
+    existing = {entry[1] for entry in row}
+    added = [f"{column}_ok" for column in SAMPLE_COLUMNS if f"{column}_ok" not in existing]
+    for name in added:
+        conn.execute(f"ALTER TABLE stove_room ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
+    for column in SAMPLE_COLUMNS:
+        conn.execute(
+            f"UPDATE stove_room SET {column}_ok = 1 "
+            f"WHERE {column} IS NOT NULL AND {column}_ok = 0"
+        )
+    conn.commit()
+
+
 def initialize(conn: sqlite3.Connection) -> None:
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS stove_room (
@@ -45,6 +60,7 @@ def initialize(conn: sqlite3.Connection) -> None:
         SELECT NULL WHERE NOT EXISTS (SELECT 1 FROM watchDog);
     """)
     conn.commit()
+    _ensure_ok_columns(conn)
 
 
 def diagnose(conn: sqlite3.Connection) -> dict[str, object]:
