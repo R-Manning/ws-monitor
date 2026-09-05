@@ -151,6 +151,7 @@ def get_downsampled(timeframe_minutes: int) -> List[Dict[str, Any]]:
     )
     SELECT
         bucket_epoch AS t_epoch,
+        datetime(bucket_epoch, 'unixepoch', 'localtime') AS datetime,
         AVG(flueF) AS flueF, AVG(sttF) AS sttF,
         AVG(tempF) AS tempF, AVG(humid) AS humid
     FROM bucketed
