@@ -37,6 +37,30 @@ class RuntimeBehaviorTests(unittest.TestCase):
             watchdog.sensor_health_check(set(watchdog.failure_counts))
             send.assert_called_once()
 
+    def test_sensor_health_alert_retries_until_delivery_succeeds(self):
+        with patch.object(watchdog, "send_message") as send:
+            send.return_value = False
+            watchdog.failure_counts = {key: watchdog.FAIL_THRESHOLD - 1 for key in watchdog.failure_counts}
+            now = watchdog._monotonic()
+            watchdog.last_alert_time = {
+                key: now - watchdog.ALERT_COOLDOWN_SEC - 1
+                for key in watchdog.last_alert_time
+            }
+            watchdog.in_failure_state = {key: False for key in watchdog.in_failure_state}
+
+            watchdog.sensor_health_check({"tempF"})
+
+            # Delivery rejected: do NOT enter failure state or start cooldown.
+            self.assertFalse(watchdog.in_failure_state["tempF"])
+            self.assertEqual(watchdog.failure_counts["tempF"], watchdog.FAIL_THRESHOLD)
+            self.assertEqual(send.call_count, 1)
+
+            # Next tick retries (threshold still crossed, cooldown not started).
+            send.return_value = True
+            watchdog.sensor_health_check({"tempF"})
+            self.assertEqual(send.call_count, 2)
+            self.assertTrue(watchdog.in_failure_state["tempF"])
+
     def test_metrics_preserve_null_values_for_dashboard_consumers(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "empty.db"

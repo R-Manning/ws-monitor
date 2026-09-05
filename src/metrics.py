@@ -23,17 +23,22 @@ def _rounded(value: Optional[float]) -> Optional[float]:
     return None if value is None else round(value, 1)
 
 
-def get_metrics(db_path: Union[str, Path]) -> list[dict]:
+def get_metrics(
+    db_path: Union[str, Path], ensure_schema: bool = True
+) -> list[dict]:
     """Return dashboard metrics without importing Dash or pandas."""
     with connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        initialize(conn)
+        if ensure_schema:
+            initialize(conn)
         settings = conn.execute(
             "SELECT sampleFreq, rateDenominator FROM settings LIMIT 1"
         ).fetchone()
-        sample_period = max(1.0, float(settings[0])) if settings and settings[0] else 5.0
+        sample_period = max(0.1, float(settings[0])) if settings and settings[0] else 5.0
         rate_window = max(1, int(settings[1])) if settings and settings[1] else 60
         rows_needed = max(2, int(rate_window / sample_period))
+        if settings:
+            rows_needed += 1
         rows = conn.execute(
             "SELECT datetime, flueF, sttF, tempF, humid "
             "FROM stove_room ORDER BY datetime DESC LIMIT ?",

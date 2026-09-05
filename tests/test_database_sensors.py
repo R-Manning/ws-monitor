@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from database import connect, initialize, insert_sample
+from database import connect, initialize, insert_sample, settings, sync_runtime_settings
 from metrics import get_metrics
 from rpiacqscript import convert_reading
 from sensors import HardwareReader, SimulatedReader, create_reader
@@ -60,6 +60,39 @@ class DatabaseTests(unittest.TestCase):
                     "SELECT tempF_ok, humid_ok, flueF_ok, sttF_ok FROM stove_room"
                 ).fetchone()
             self.assertEqual(row, (1, 0, 1, 1))
+
+    def test_context_manager_closes_connection_handle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cm.db"
+            with connect(path) as conn:
+                conn.execute("SELECT 1")
+            with self.assertRaises(sqlite3.ProgrammingError):
+                conn.execute("SELECT 1")
+
+    def test_sync_runtime_settings_aligns_table_to_declared_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sync.db"
+            with connect(path) as conn:
+                initialize(conn)
+                conn.execute("UPDATE settings SET sampleFreq=99, dataHist=42")
+                conn.commit()
+            with connect(path) as conn:
+                self.assertEqual(sync_runtime_settings(conn), (5.0, 7))
+                self.assertEqual(settings(conn), (5.0, 7))
+
+    def test_get_metrics_without_schema_init_requires_existing_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(sqlite3.OperationalError):
+                get_metrics(Path(directory) / "no-schema.db", ensure_schema=False)
+
+    def test_get_metrics_without_schema_init_works_on_initialized_db(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "init.db"
+            with connect(path) as conn:
+                initialize(conn)
+                insert_sample(conn, {"tempF": 70, "humid": 45, "flueF": 200, "sttF": 80}, "2026-01-01 00:00:00")
+            metrics = get_metrics(path, ensure_schema=False)
+        self.assertEqual(metrics[0]["Room (F)"], 70.0)
 
 
 class SensorTests(unittest.TestCase):

@@ -9,12 +9,21 @@ from typing import Dict, Optional, Union
 SAMPLE_COLUMNS = ("tempF", "humid", "flueF", "sttF")
 
 
+class ManagedConnection(sqlite3.Connection):
+    """SQLite connection whose context manager also closes the handle."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def connect(path: Union[str, Path]) -> sqlite3.Connection:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(p, timeout=10)
+    conn = sqlite3.connect(p, timeout=10, factory=ManagedConnection)
     conn.execute("PRAGMA busy_timeout=10000")
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
@@ -26,15 +35,17 @@ def _ensure_ok_columns(conn: sqlite3.Connection) -> None:
     added = [f"{column}_ok" for column in SAMPLE_COLUMNS if f"{column}_ok" not in existing]
     for name in added:
         conn.execute(f"ALTER TABLE stove_room ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
-    for column in SAMPLE_COLUMNS:
-        conn.execute(
-            f"UPDATE stove_room SET {column}_ok = 1 "
-            f"WHERE {column} IS NOT NULL AND {column}_ok = 0"
-        )
-    conn.commit()
+    if added:
+        for column in SAMPLE_COLUMNS:
+            conn.execute(
+                f"UPDATE stove_room SET {column}_ok = 1 "
+                f"WHERE {column} IS NOT NULL AND {column}_ok = 0"
+            )
+        conn.commit()
 
 
 def initialize(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS stove_room (
             id INTEGER PRIMARY KEY,
@@ -53,9 +64,8 @@ def initialize(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS watchDog (
             id INTEGER PRIMARY KEY CHECK (id = 1), emailtimelastsent TIMESTAMP
         );
-        CREATE INDEX IF NOT EXISTS idx_stove_room_datetime ON stove_room(datetime);
         INSERT INTO settings(sampleFreq, dataHist, graphRange, rateDenominator)
-        SELECT 5, 30, 12, 60 WHERE NOT EXISTS (SELECT 1 FROM settings);
+        SELECT 5, 7, 12, 60 WHERE NOT EXISTS (SELECT 1 FROM settings);
         INSERT INTO watchDog (emailtimelastsent)
         SELECT NULL WHERE NOT EXISTS (SELECT 1 FROM watchDog);
     """)
@@ -105,3 +115,14 @@ def settings(conn: sqlite3.Connection, default_interval: float = 5.0, default_hi
         return max(0.1, float(row[0])), max(1, int(row[1] or default_history))
     except (TypeError, ValueError):
         return default_interval, default_history
+
+
+def sync_runtime_settings(conn: sqlite3.Connection) -> tuple[float, int]:
+    """Align the settings table with the declared Config defaults."""
+    conn.execute(
+        "UPDATE settings SET sampleFreq=?, dataHist=? WHERE NOT "
+        "(sampleFreq=? AND dataHist=?)",
+        (5, 7, 5, 7),
+    )
+    conn.commit()
+    return settings(conn)

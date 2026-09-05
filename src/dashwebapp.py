@@ -72,6 +72,7 @@ _webrtc_relay = None        # aiortc MediaRelay — fan-out to multiple viewers
 _webrtc_lock = Lock()
 _webrtc_loop = None         # asyncio event loop for aiortc
 _webrtc_thread = None       # daemon thread running the event loop
+_webrtc_supervisors_running = False
 _active_peer_connections = set()
 _pending_peer_connections = {}
 _pc_started: Dict[int, float] = {}       # id(pc) -> creation time, for stale cleanup
@@ -146,12 +147,12 @@ def get_downsampled(timeframe_minutes: int) -> List[Dict[str, Any]]:
     bucketed AS (
         SELECT
             (CAST(strftime('%s', datetime) AS INTEGER) / ?) * ? AS bucket_epoch,
-            flueF, sttF, tempF, humid
+            datetime, flueF, sttF, tempF, humid
         FROM windowed
     )
     SELECT
         bucket_epoch AS t_epoch,
-        datetime(bucket_epoch, 'unixepoch', 'localtime') AS datetime,
+        MIN(datetime) AS datetime,
         AVG(flueF) AS flueF, AVG(sttF) AS sttF,
         AVG(tempF) AS tempF, AVG(humid) AS humid
     FROM bucketed
@@ -260,7 +261,7 @@ def _build_figure(timeframe_minutes: int, compact: bool) -> go.Figure:
 
 def update_metrics() -> list[dict]:
     """Return current values and rate/min rows without pandas."""
-    rows = get_metrics(DB_PATH)
+    rows = get_metrics(DB_PATH, ensure_schema=False)
     return [
         {key: ("Unavailable" if value is None else value) for key, value in row.items()}
         for row in rows
@@ -271,6 +272,22 @@ def update_metrics() -> list[dict]:
 # WebRTC camera pipeline
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _stop_player_tracks(player):
+    """Starve the publisher task so loop.stop() and restarts return promptly."""
+    track = getattr(player, "video", None)
+    if track is not None:
+        try:
+            track.stop()
+        except Exception:
+            pass
+    audio = getattr(player, "audio", None)
+    if audio is not None:
+        try:
+            audio.stop()
+        except Exception:
+            pass
+
+
 def _ensure_webrtc_running():
     """Start the RTSP MediaPlayer and asyncio loop on first viewer."""
     global _webrtc_player, _webrtc_relay, _webrtc_loop, _webrtc_thread
@@ -279,46 +296,48 @@ def _ensure_webrtc_running():
         if _webrtc_player is not None:
             return
 
-        # If a camera restart is in flight on an existing loop, wait briefly
-        # for the fresh player instead of spawning a second loop.
-        if _webrtc_loop is not None:
-            for _ in range(20):
-                if _webrtc_player is not None:
-                    return
-                time.sleep(0.1)
+        # Reuse a live loop (e.g. after a restart); only build a new one if the
+        # previous loop was stopped during teardown.
+        if _webrtc_loop is None or _webrtc_loop.is_closed():
+            _webrtc_loop = asyncio.new_event_loop()
 
-        # Start asyncio event loop FIRST — MediaPlayer.__init__ captures
-        # asyncio.get_event_loop() internally, so the loop must already be
-        # running in the thread context where the player is created.
-        _webrtc_loop = asyncio.new_event_loop()
+            def _run_loop():
+                asyncio.set_event_loop(_webrtc_loop)
+                _webrtc_loop.run_forever()
 
-        def _run_loop():
-            asyncio.set_event_loop(_webrtc_loop)
-            _webrtc_loop.run_forever()
+            _webrtc_thread = threading.Thread(target=_run_loop, daemon=True)
+            _webrtc_thread.start()
 
-        _webrtc_thread = threading.Thread(target=_run_loop, daemon=True)
-        _webrtc_thread.start()
-
-        # Create MediaPlayer on the running loop so its internal worker
-        # thread gets the correct event loop for packet delivery.
-        async def _init_player():
-            global _webrtc_player, _webrtc_relay
-            _webrtc_player = MediaPlayer(RTSP_URL, decode=False)
-            _webrtc_relay = MediaRelay()
-
-        future = asyncio.run_coroutine_threadsafe(_init_player(), _webrtc_loop)
-        future.result(timeout=15)
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                _init_player_if_missing(), _webrtc_loop
+            )
+            future.result(timeout=15)
+        except Exception as exc:
+            print(f"WEBRTC: player init failed: {exc}", flush=True)
+            return
 
         # Launch camera-health monitor + stale-peer sweeper on the loop.
         _webrtc_loop.call_soon_threadsafe(_start_supervisors)
 
 
+async def _init_player_if_missing():
+    """Create the MediaPlayer (and relay) on the running loop if absent."""
+    global _webrtc_player, _webrtc_relay
+    if _webrtc_player is None:
+        _webrtc_player = MediaPlayer(RTSP_URL, decode=False)
+    if _webrtc_relay is None:
+        _webrtc_relay = MediaRelay()
+
+
 def _teardown_webrtc():
     """Close the RTSP player and event loop when no viewers remain."""
     global _webrtc_player, _webrtc_relay, _webrtc_loop, _webrtc_thread
+    global _webrtc_supervisors_running
 
     with _webrtc_lock:
         if _webrtc_player is None:
+            _webrtc_supervisors_running = False
             return
 
         loop = _webrtc_loop
@@ -335,6 +354,9 @@ def _teardown_webrtc():
         _pc_started.clear()
         _pending_peer_connections.clear()
 
+        # Stop MediaPlayer tracks BEFORE the loop stops (prevents a busy loop on stop).
+        _stop_player_tracks(_webrtc_player)
+
         # Stop the event loop (this tears down MediaPlayer tracks)
         try:
             loop.call_soon_threadsafe(loop.stop)
@@ -347,6 +369,7 @@ def _teardown_webrtc():
         _webrtc_relay = None
         _webrtc_loop = None
         _webrtc_thread = None
+        _webrtc_supervisors_running = False
 
 
 def _schedule_stop_if_idle():
@@ -386,6 +409,10 @@ def _cancel_pending_stop():
 
 def _start_supervisors():
     """Launch background coroutines on the WebRTC loop (runs on the loop)."""
+    global _webrtc_supervisors_running
+    if _webrtc_supervisors_running:
+        return
+    _webrtc_supervisors_running = True
 
     async def _launch():
         asyncio.create_task(_monitor_player_health())
@@ -410,19 +437,18 @@ async def _restart_player():
     _pc_started.clear()
     _pending_peer_connections.clear()
 
-    try:
-        if _webrtc_player is not None:
-            await _webrtc_player.stop()
-    except Exception:
-        pass
-    try:
-        if _webrtc_relay is not None:
+    if _webrtc_player is not None:
+        _stop_player_tracks(_webrtc_player)
+        _webrtc_player = None
+    if _webrtc_relay is not None:
+        try:
             await _webrtc_relay.stop()
-    except Exception:
-        pass
+        except Exception:
+            pass
+        _webrtc_relay = None
 
-    _webrtc_relay = MediaRelay()
     try:
+        _webrtc_relay = MediaRelay()
         _webrtc_player = MediaPlayer(RTSP_URL, decode=False)
     except Exception as exc:
         print(f"WEBRTC: player restart failed: {exc}", flush=True)
@@ -438,6 +464,11 @@ async def _monitor_player_health():
         player = _webrtc_player
         relay = _webrtc_relay
         if player is None or relay is None or player.video is None:
+            misses += 1
+            if misses >= HEALTH_MAX_MISSES:
+                print("WEBRTC: camera pipeline unavailable; restarting player", flush=True)
+                await _restart_player()
+                misses = 0
             continue
         probe = None
         try:

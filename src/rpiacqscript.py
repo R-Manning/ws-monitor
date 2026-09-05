@@ -6,7 +6,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from config import load_config
-from database import connect, delete_older_than, diagnose as diagnose_database, initialize, insert_sample, settings
+from database import connect, delete_older_than, diagnose as diagnose_database, initialize, insert_sample, sync_runtime_settings
 from logging_setup import configure_logging
 from sensors import create_reader
 
@@ -52,12 +52,15 @@ def run(config: Any, samples: Optional[int] = None, once: bool = False, diagnose
     reader = create_reader(config.sensor_mode)
     conn = connect(config.db_path)
     try:
-        initialize(conn)
+        try:
+            initialize(conn)
+        except Exception:
+            logger.exception("schema initialization failed")
         if diagnose:
             print({"db_path": str(config.db_path), **diagnose_database(conn),
                    "sensor_mode": type(reader).__name__, "sensors": reader.diagnose()})
             return 0
-        interval, history = settings(conn, config.sample_interval, config.history_days)
+        interval, history = sync_runtime_settings(conn)
         delete_older_than(conn, history)
         count = 0
         stopped = False
@@ -68,6 +71,7 @@ def run(config: Any, samples: Optional[int] = None, once: bool = False, diagnose
 
         signal.signal(signal.SIGINT, stop)
         signal.signal(signal.SIGTERM, stop)
+        last_retention_cleanup = time.monotonic()
         next_tick = time.monotonic()
         while not stopped and (samples is None or count < samples) and not (once and count):
             values = read_with_retries(reader, config.retries, logger)
@@ -85,8 +89,9 @@ def run(config: Any, samples: Optional[int] = None, once: bool = False, diagnose
                     logger.exception("threshold alert failed")
             logger.info("sample %d: %s", count + 1, values)
             count += 1
-            if count % max(1, int(86400 / interval)) == 0:
+            if time.monotonic() - last_retention_cleanup >= 86400.0:
                 delete_older_than(conn, history)
+                last_retention_cleanup = time.monotonic()
             next_tick += max(2.0, interval)
             time.sleep(max(0.0, next_tick - time.monotonic()))
         return 0

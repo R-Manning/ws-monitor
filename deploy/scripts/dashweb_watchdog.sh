@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# dashweb-watchdog.sh — restart dashweb.service when its /_healthz probe stops
-# responding. Catches HANGS (process alive but unresponsive) that systemd's
-# Restart=always cannot, because a hung process never exits.
+# dashweb_watchdog.sh — restart the dashboard service when its /_healthz probe
+# stops responding. Catches HANGS (process alive but unresponsive) that
+# systemd's Restart=always cannot, because a hung process never exits.
+#
+# The service name is overridable via DASHWEB_SERVICE (the canonical template
+# uses ws-monitor-dashboard.service; the live Pi unit is dashweb.service).
 set -u
 
 URL="http://127.0.0.1:8050/_healthz"
+SERVICE="${DASHWEB_SERVICE:-dashweb.service}"
 POLL_S=15
 CURL_TIMEOUT_S=6
 THRESHOLD=3                 # consecutive failures before restarting
@@ -25,10 +29,15 @@ while true; do
     logger -t dashweb-watchdog "healthz check failed ($failcount/$THRESHOLD)"
     if [ "$failcount" -ge "$THRESHOLD" ]; then
       if [ $((now - last_restart)) -ge "$MIN_RESTART_GAP_S" ]; then
-        logger -t dashweb-watchdog "restarting dashweb.service"
-        systemctl restart dashweb.service
-        last_restart=$now
-        failcount=0
+        if systemctl restart "$SERVICE"; then
+          logger -t dashweb-watchdog "restarted $SERVICE"
+          last_restart=$now
+          failcount=0
+        else
+          # Restart failed: keep the failure counter so we retry next poll
+          # instead of latching into a silent 90s gap.
+          logger -t dashweb-watchdog "restart of $SERVICE FAILED (exit $?)"
+        fi
       else
         logger -t dashweb-watchdog "restart skipped (too soon after last restart)"
       fi

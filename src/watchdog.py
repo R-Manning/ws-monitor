@@ -1,5 +1,7 @@
 import datetime as dt
+import threading
 import time
+from pathlib import Path
 from typing import Dict, List, Tuple, Set, Optional
 
 """including this here for testing purposes----
@@ -50,21 +52,33 @@ _monotonic = time.monotonic  # localize for tiny perf win
 
 
 # ---------- DB helpers ----------
+_db_initialized: Set[str] = set()
+_ensure_lock = threading.Lock()
+
+
+def _ensure_database(path: str) -> None:
+    """Initialize a database's schema once per path (thread-safe)."""
+    key = str(Path(path).resolve())
+    if key in _db_initialized:
+        return
+    with _ensure_lock:
+        if key in _db_initialized:
+            return
+        with connect(key) as conn:
+            initialize(conn)
+        _db_initialized.add(key)
+
+
 def _get_last_sent() -> dt.datetime:
     """Returns last send time (localtime) stored in DB."""
-    # Identifiers are constants defined above (safe); values are parameterized when present.
+    _ensure_database(DB_NAME)
     with connect(DB_NAME) as conn:
-        initialize(conn)
-        cur = conn.execute(f"SELECT {COL_LAST_SENT} FROM {TABLE} LIMIT 1")
-        row = cur.fetchone()
-    # If the table is guaranteed to have one row, row[0] is a datetime string; normalize to aware-free datetime
-    # SQLite returns str for datetime('now','localtime'); parse with fromisoformat if needed.
+        row = conn.execute(f"SELECT {COL_LAST_SENT} FROM {TABLE} LIMIT 1").fetchone()
     if row is None or row[0] is None:
         return dt.datetime.min
     val = row[0]
     if isinstance(val, dt.datetime):
         return val
-    # Attempt ISO 8601 parse; fallback to "a while ago" if needed.
     try:
         return dt.datetime.fromisoformat(val)
     except Exception:
@@ -74,10 +88,9 @@ def _get_last_sent() -> dt.datetime:
 
 def _update_last_sent() -> None:
     """Update the last-sent timestamp in the watchdog table to the current local time."""
+    _ensure_database(DB_NAME)
     with connect(DB_NAME) as conn:
-        initialize(conn)
-        cur = conn.cursor()
-        cur.execute(
+        conn.execute(
             f"UPDATE {TABLE} SET {COL_LAST_SENT} = datetime('now','localtime')"
         )
         conn.commit()
@@ -85,8 +98,8 @@ def _update_last_sent() -> None:
 
 def _update_last_sent_for(db_path: str) -> None:
     """Persist cooldown state for an explicitly selected database."""
+    _ensure_database(db_path)
     with connect(db_path) as conn:
-        initialize(conn)
         conn.execute(
             f"UPDATE {TABLE} SET {COL_LAST_SENT} = datetime('now','localtime')"
         )
@@ -94,8 +107,8 @@ def _update_last_sent_for(db_path: str) -> None:
 
 
 def _get_last_sent_for(db_path: str) -> dt.datetime:
+    _ensure_database(db_path)
     with connect(db_path) as conn:
-        initialize(conn)
         row = conn.execute(f"SELECT {COL_LAST_SENT} FROM {TABLE} LIMIT 1").fetchone()
     if row is None or row[0] is None:
         return dt.datetime.min
@@ -173,7 +186,7 @@ def watchdog(db_path: Optional[str] = None) -> None:
         if not _cooldown_window_open(now_local, ALERT_DELAY_SEC, db_path):
             return  # too soon; skip work entirely
         path = db_path or DB_NAME
-        metrics = get_metrics(path)  # only called if we *might* send
+        metrics = get_metrics(path, ensure_schema=False)  # only called if we *might* send
     except Exception:
         logger.exception("unable to evaluate threshold alert")
         return
@@ -199,18 +212,18 @@ def sensor_health_check(bad_sensors: Set[str]) -> None:
 
     now = _monotonic()
     messages: List[str] = []
+    crossed_ids: Set[str] = set()
 
     for sensor in failure_counts:
         if sensor in bad_sensors:
             failure_counts[sensor] += 1
 
-            crossed = (failure_counts[sensor] == FAIL_THRESHOLD)
+            crossed = (failure_counts[sensor] >= FAIL_THRESHOLD)
             cooled  = (now - last_alert_time[sensor] >= ALERT_COOLDOWN_SEC)
 
             if crossed and cooled:
                 messages.append(f"[ALERT] {sensor} failed {FAIL_THRESHOLD} consecutive reads.")
-                last_alert_time[sensor] = now
-                in_failure_state[sensor] = True
+                crossed_ids.add(sensor)
         else:
             # Good read this tick
             if REPORT_RECOVERY and in_failure_state[sensor] and failure_counts[sensor] >= FAIL_THRESHOLD:
@@ -219,7 +232,14 @@ def sensor_health_check(bad_sensors: Set[str]) -> None:
             in_failure_state[sensor] = False
 
     if messages:
+        logger.info("sensor health alert: %s", messages)
         try:
-            send_message("\n".join(messages))
+            if send_message("\n".join(messages)):
+                # Delivery-gated state: only enter failure state (and start the
+                # per-sensor cooldown) after Telegram actually accepted the alert;
+                # otherwise retry next tick while the threshold is still crossed.
+                for sensor in crossed_ids:
+                    last_alert_time[sensor] = now
+                    in_failure_state[sensor] = True
         except Exception:
             logger.exception("unable to send sensor health alert")
