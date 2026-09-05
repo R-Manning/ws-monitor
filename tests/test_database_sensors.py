@@ -14,6 +14,16 @@ from rpiacqscript import convert_reading
 from sensors import HardwareReader, SimulatedReader, create_reader
 
 
+class _FakeClock:
+    """Mutable monotonic clock for driving cooldown timers in tests."""
+
+    def __init__(self, start: float = 1000.0):
+        self.t = start
+
+    def __call__(self) -> float:
+        return self.t
+
+
 class DatabaseTests(unittest.TestCase):
     def test_sample_keeps_missing_values_as_null(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -138,8 +148,59 @@ class SensorTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "SPI unavailable"):
                 create_reader("auto")
 
+    def test_dht_cooldown_skips_sensor_until_window_elapses(self):
+        fake = _FakeClock()
+        modules, _ = self._hardware_modules(dht_mode="raise")
+        with patch.dict(sys.modules, modules):
+            with patch("sensors._moment", fake):
+                reader = HardwareReader()
+
+                out = reader.read()
+                self.assertIsNone(out["humid"])
+                self.assertIsNone(out["tempC"])
+
+                dht = modules["adafruit_dht"].DHT11.instances[-1]
+                acc = list(dht.accesses)
+
+                out2 = reader.read()
+                self.assertIsNone(out2["humid"])
+                self.assertEqual(
+                    list(dht.accesses), acc, "DHT must not be probed during cooldown"
+                )
+
+                fake.t += 40  # past the 30s window
+                out3 = reader.read()
+                self.assertIsNone(out3["humid"])
+                self.assertGreater(
+                    list(dht.accesses), acc, "DHT is probed again after cooldown"
+                )
+
+    def test_dht_success_resets_cooldown(self):
+        fake = _FakeClock()
+        modules, _ = self._hardware_modules()
+        with patch.dict(sys.modules, modules):
+            with patch("sensors._moment", fake):
+                reader = HardwareReader()
+                dht = modules["adafruit_dht"].DHT11.instances[-1]
+
+                reader.dht.mode = "raise"
+                reader.read()
+                self.assertIsNone(reader.read()["humid"])  # inside cooldown
+
+                fake.t += 40
+                dht.mode = "valid"
+                out = reader.read()  # probes again, succeeds, clears cooldown
+                self.assertEqual(out["humid"], 45.0)
+
+                acc = list(dht.accesses)
+                out2 = reader.read()  # immediate re-read must probe again
+                self.assertEqual(out2["humid"], 45.0)
+                self.assertGreater(
+                    list(dht.accesses), acc, "successful read must clear cooldown"
+                )
+
     @staticmethod
-    def _hardware_modules(ignored_address=None, clear_faults=True):
+    def _hardware_modules(ignored_address=None, clear_faults=True, dht_mode="valid"):
         class Pin:
             def __init__(self, name):
                 self.name = name
@@ -150,8 +211,27 @@ class SensorTests(unittest.TestCase):
                 self.direction = None
 
         class DHT11:
+            instances = []
+
             def __init__(self, pin):
                 self.pin = pin
+                self.mode = dht_mode  # "valid" | "raise"
+                self.accesses = []
+                type(self).instances.append(self)
+
+            @property
+            def humidity(self):
+                self.accesses.append("humidity")
+                if self.mode == "raise":
+                    raise RuntimeError("DHT read failed")
+                return 45.0
+
+            @property
+            def temperature(self):
+                self.accesses.append("temperature")
+                if self.mode == "raise":
+                    raise RuntimeError("DHT read failed")
+                return 20.0
 
         class MAX31856:
             instances = []

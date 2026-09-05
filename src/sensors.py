@@ -2,10 +2,14 @@
 
 from dataclasses import dataclass
 import math
+import os
+import time
 from typing import Dict, Optional, Union
 
 
 FIELDS = ("tempC", "humid", "flueC", "sttC")
+
+_moment = time.monotonic  # localize for tiny perf win + test injection
 
 _MAX31856_CR0 = 0x00
 _MAX31856_CJHF = 0x03
@@ -58,6 +62,15 @@ class HardwareReader:
         self.stt = adafruit_max31856.MAX31856(spi, stt_cs, adafruit_max31856.ThermocoupleType.K)
         self._repair_stt_thresholds()
 
+        # The DHT11 bit-bangs its GPIO; after a failed read it can wedge and
+        # block for seconds. Back off re-probing it for a while so a flaky
+        # sensor does not stall the tick — flue/stt readings keep flowing.
+        self._dht_available_after = 0.0
+        try:
+            self._dht_cooldown_s = max(0.0, float(os.getenv("WSM_DHT_COOLDOWN_S", "30")))
+        except (TypeError, ValueError):
+            self._dht_cooldown_s = 30.0
+
     def _repair_stt_thresholds(self) -> None:
         """Restore the defective STT module's power-on threshold defaults."""
         for address, value in _MAX31856_STT_DEFAULTS.items():
@@ -79,10 +92,18 @@ class HardwareReader:
 
     def read(self) -> Dict[str, Optional[float]]:
         result: Dict[str, Optional[float]] = {}
-        try:
-            result["humid"], result["tempC"] = self.dht.humidity, self.dht.temperature
-        except Exception:
+        now = _moment()
+        if now < self._dht_available_after:
             result.update(humid=None, tempC=None)
+        else:
+            try:
+                result["humid"], result["tempC"] = self.dht.humidity, self.dht.temperature
+            except Exception:
+                result.update(humid=None, tempC=None)
+            if result.get("tempC") is None or result.get("humid") is None:
+                self._dht_available_after = now + self._dht_cooldown_s
+            else:
+                self._dht_available_after = 0.0
         for field, sensor in (("flueC", self.flue), ("sttC", self.stt)):
             try:
                 result[field] = sensor.temperature
