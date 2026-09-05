@@ -78,7 +78,7 @@ def _update_last_sent() -> None:
         initialize(conn)
         cur = conn.cursor()
         cur.execute(
-            f"UPDATE {TABLE} SET {COL_LAST_SENT} = datetime('now','localtime') WHERE id = 1"
+            f"UPDATE {TABLE} SET {COL_LAST_SENT} = datetime('now','localtime')"
         )
         conn.commit()
 
@@ -88,7 +88,7 @@ def _update_last_sent_for(db_path: str) -> None:
     with connect(db_path) as conn:
         initialize(conn)
         conn.execute(
-            f"UPDATE {TABLE} SET {COL_LAST_SENT} = datetime('now','localtime') WHERE id = 1"
+            f"UPDATE {TABLE} SET {COL_LAST_SENT} = datetime('now','localtime')"
         )
         conn.commit()
 
@@ -96,7 +96,7 @@ def _update_last_sent_for(db_path: str) -> None:
 def _get_last_sent_for(db_path: str) -> dt.datetime:
     with connect(db_path) as conn:
         initialize(conn)
-        row = conn.execute(f"SELECT {COL_LAST_SENT} FROM {TABLE} WHERE id = 1").fetchone()
+        row = conn.execute(f"SELECT {COL_LAST_SENT} FROM {TABLE} LIMIT 1").fetchone()
     if row is None or row[0] is None:
         return dt.datetime.min
     try:
