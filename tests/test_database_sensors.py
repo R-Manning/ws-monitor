@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from database import connect, initialize, insert_sample, settings, sync_runtime_settings
 from metrics import get_metrics
 from rpiacqscript import convert_reading
-from sensors import HardwareReader, SimulatedReader, create_reader
+from sensors import HardwareReader, SimulatedReader, _plausible, create_reader
 
 
 class _FakeClock:
@@ -110,6 +110,51 @@ class SensorTests(unittest.TestCase):
         reader = create_reader("simulated")
         self.assertIsInstance(reader, SimulatedReader)
         self.assertEqual(reader.read(), {"tempC": 20.0, "humid": 45.0, "flueC": 100.0, "sttC": 80.0})
+
+    def test_plausible_rejects_implausible_reads(self):
+        self.assertTrue(_plausible(20.0, 1100.0))          # 68 F, fine
+        self.assertTrue(_plausible(300.0, 1100.0))         # 572 F, fine below clamp
+        self.assertFalse(_plausible(560.0, 1100.0))        # ~1040 F, would clamp to 1000
+        self.assertFalse(_plausible(610.0, 1100.0))        # ~1130 F, above stt ceiling
+        self.assertFalse(_plausible(500.0, 850.0))         # 932 F, above flue ceiling
+        self.assertTrue(_plausible(450.0, 850.0))          # 842 F, fine for flue
+        self.assertFalse(_plausible(None, 1100.0))
+        self.assertFalse(_plausible(float("nan"), 1100.0))
+        self.assertFalse(_plausible(float("inf"), 1100.0))
+
+    def test_stt_saturation_is_rejected_and_fault_rearmed(self):
+        modules, max31856 = self._hardware_modules()
+        with patch.dict(sys.modules, modules):
+            reader = HardwareReader()
+            stt = reader.stt
+            flue = reader.flue
+            stt.temperature = 560.0  # ~1040 F: would clamp to exactly 1000 in the collector
+            out = reader.read()
+
+        self.assertIsNone(out["sttC"], "saturated stt read must be rejected")
+        self.assertEqual(out["flueC"], 300.0)
+        self.assertEqual(stt.writes[-1], (0x00, 0x12), "fault must be re-armed after reject")
+        self.assertEqual(flue.writes, [])
+
+    def test_stt_read_above_ceiling_is_rejected(self):
+        modules, _ = self._hardware_modules()
+        with patch.dict(sys.modules, modules):
+            reader = HardwareReader()
+            reader.stt.temperature = 610.0  # ~1130 F > 1100 ceiling
+            out = reader.read()
+        self.assertIsNone(out["sttC"])
+        self.assertEqual(out["flueC"], 300.0)
+
+    def test_flue_read_above_ceiling_is_rejected_without_stt_rearm(self):
+        modules, max31856 = self._hardware_modules()
+        with patch.dict(sys.modules, modules):
+            reader = HardwareReader()
+            flue, stt = max31856.MAX31856.instances
+            flue.temperature = 500.0  # 932 F > 850 ceiling (still < 1000 clamp)
+            out = reader.read()
+        self.assertIsNone(out["flueC"], "over-ceiling flue read must be rejected")
+        self.assertEqual(out["sttC"], 300.0)
+        self.assertEqual(stt.writes[-1], (0x00, 0x12), "only the rejected channel re-arms")
 
     def test_conversion_handles_partial_reading(self):
         self.assertEqual(
@@ -242,6 +287,7 @@ class SensorTests(unittest.TestCase):
                 self.registers = {0x00: 0x10, 0x0F: 0x28}
                 self.ignored_address = ignored_address if cs.pin.name == "D6" else None
                 self.clear_faults = clear_faults
+                self.temperature = 300.0  # defaults: ~572 F, plausible for both channels
                 type(self).instances.append(self)
 
             def _write_u8(self, address, value):

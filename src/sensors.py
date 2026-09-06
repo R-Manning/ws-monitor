@@ -1,6 +1,7 @@
 """Sensor readers with lazy Raspberry Pi imports and a deterministic simulator."""
 
 from dataclasses import dataclass
+import logging
 import math
 import os
 import time
@@ -8,6 +9,13 @@ from typing import Dict, Optional, Union
 
 
 FIELDS = ("tempC", "humid", "flueC", "sttC")
+
+logger = logging.getLogger("ws-monitor.sensors")
+
+# Upper bound used by _c_to_f(...) in the collector: anything at/above this
+# Fahrenheit value reads back as exactly 1000.0, indistinguishable from this
+# stove's MAX31856 saturation event.
+_CONVERSION_CLAMP_F = 1000.0
 
 _moment = time.monotonic  # localize for tiny perf win + test injection
 
@@ -27,6 +35,28 @@ _MAX31856_FAULTCLR = 0x02
 
 def _valid(value: object) -> bool:
     return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+
+def _plausible(value_c: object, max_f: float) -> bool:
+    """Whether a raw Celsius MAX31856 reading survives conversion plausibly.
+
+    Rejects non-finite input, reads above the channel ceiling, and any reading
+    that would clamp to exactly 1000.0 F in the collector callback.
+    """
+    if not isinstance(value_c, (int, float)):
+        return False
+    f = float(value_c) * 1.8 + 32.0
+    if not math.isfinite(f):
+        return False
+    return f <= max_f and f < _CONVERSION_CLAMP_F
+
+
+def _env_max_f(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, ""))
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) and value > 0.0 else default
 
 
 @dataclass
@@ -71,6 +101,12 @@ class HardwareReader:
         except (TypeError, ValueError):
             self._dht_cooldown_s = 30.0
 
+        # Plausibility ceilings for the MAX31856 channels (Fahrenheit, raw
+        # readings are Celsius). Values at/above the collector's conversion
+        # clamp are always rejected; these bound what "sane" means above that.
+        self._stt_max_f = _env_max_f("WSM_STT_MAX_F", 1100.0)
+        self._flue_max_f = _env_max_f("WSM_FLUE_MAX_F", 850.0)
+
     def _repair_stt_thresholds(self) -> None:
         """Restore the defective STT module's power-on threshold defaults."""
         for address, value in _MAX31856_STT_DEFAULTS.items():
@@ -105,11 +141,31 @@ class HardwareReader:
             else:
                 self._dht_available_after = 0.0
         for field, sensor in (("flueC", self.flue), ("sttC", self.stt)):
+            max_f = self._flue_max_f if field == "flueC" else self._stt_max_f
             try:
-                result[field] = sensor.temperature
+                raw = sensor.temperature
             except Exception:
+                raw = None
+            if raw is not None and _plausible(raw, max_f):
+                result[field] = raw
+            else:
+                if raw is not None:
+                    logger.warning(
+                        "%s read %.2f C rejected (out of plausible range, max %.0f F)",
+                        field, float(raw), max_f,
+                    )
+                    self._rearm(field)
                 result[field] = None
         return result
+
+    def _rearm(self, field: str) -> None:
+        """Clear a potentially latched MAX31856 fault on the rejected channel."""
+        try:
+            sensor = self.stt if field == "sttC" else self.flue
+            cr0 = sensor._read_register(_MAX31856_CR0, 1)[0]
+            sensor._write_u8(_MAX31856_CR0, cr0 | _MAX31856_FAULTCLR)
+        except Exception:
+            pass
 
     def diagnose(self) -> dict[str, str]:
         values = self.read()
