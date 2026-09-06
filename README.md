@@ -93,6 +93,12 @@ sudo systemctl enable --now ws-monitor-collector.service
 sudo systemctl enable --now ws-monitor-dashboard.service
 ```
 
+Unit naming: the canonical service names are `ws-monitor-collector.service`,
+`ws-monitor-dashboard.service`, and `ws-monitor-watchdog.service` (below).
+Deployments that predate the rename may still be running as `rpiacqscript.service`,
+`dashweb.service`, and `dashweb-watchdog.service`; after the rename migration
+those old names are just aliases of the canonical units and keep working.
+
 ### Resilience and automatic recovery
 
 The dashboard service is hardened against three failure modes:
@@ -103,18 +109,18 @@ The dashboard service is hardened against three failure modes:
 
 2. **Process hang (alive but unresponsive)** — the app exposes a lightweight
    liveness endpoint `GET /_healthz` (returns 200 whenever Flask can serve).
-   The optional `dashweb-watchdog.service` polls it every 15 s and runs
-   `systemctl restart dashweb.service` after 3 consecutive failures (min 90 s
-   between restarts to avoid thrash):
+   The optional `ws-monitor-watchdog.service` polls it every 15 s and runs
+   `systemctl restart ws-monitor-dashboard.service` after 3 consecutive failures
+   (min 90 s between restarts to avoid thrash):
 
    ```sh
-   sudo install -m 0755 deploy/scripts/dashweb_watchdog.sh /usr/local/sbin/dashweb_watchdog.sh
-   sudo install -m 0644 deploy/systemd/dashweb-watchdog.service.template /etc/systemd/system/dashweb-watchdog.service
+   sudo install -m 0755 deploy/scripts/ws-monitor-watchdog.sh /usr/local/sbin/ws-monitor-watchdog.sh
+   sudo install -m 0644 deploy/systemd/ws-monitor-watchdog.service.template /etc/systemd/system/ws-monitor-watchdog.service
    sudo systemctl daemon-reload
-   sudo systemctl enable --now dashweb-watchdog.service
+   sudo systemctl enable --now ws-monitor-watchdog.service
    ```
 
-   Watchdog activity is logged under the `dashweb-watchdog` journal tag; the
+   Watchdog activity is logged under the `ws-monitor-watchdog` journal tag; the
    app logs `WEBRTC:` lines for in-process restarts.
 
 3. **Camera/RTSP outage or abandoned signaling** — inside the WebRTC loop the
