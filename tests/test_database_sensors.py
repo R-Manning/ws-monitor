@@ -71,6 +71,16 @@ class DatabaseTests(unittest.TestCase):
                 ).fetchone()
             self.assertEqual(row, (1, 0, 1, 1))
 
+    def test_initialize_creates_sensor_status_table(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "status.db"
+            with connect(path) as conn:
+                initialize(conn)
+                tables = [row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()]
+        self.assertIn("sensor_status", tables)
+
     def test_context_manager_closes_connection_handle(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "cm.db"

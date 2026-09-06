@@ -64,6 +64,11 @@ def initialize(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS watchDog (
             id INTEGER PRIMARY KEY CHECK (id = 1), emailtimelastsent TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS sensor_status (
+            sensor TEXT PRIMARY KEY,
+            stuck INTEGER NOT NULL DEFAULT 0,
+            changed_at TIMESTAMP
+        );
         INSERT INTO settings(sampleFreq, dataHist, graphRange, rateDenominator)
         SELECT 5, 7, 12, 60 WHERE NOT EXISTS (SELECT 1 FROM settings);
         INSERT INTO watchDog (emailtimelastsent)

@@ -1,8 +1,11 @@
 import datetime as dt
+import logging
+import os
 import threading
 import time
+from collections import deque
 from pathlib import Path
-from typing import Dict, List, Tuple, Set, Optional
+from typing import Dict, List, Tuple, Set, Optional, Deque
 
 """including this here for testing purposes----
 
@@ -21,7 +24,6 @@ except ImportError:  # Alerting is optional and must not disable acquisition.
 from metrics import get_metrics
 from database import connect, initialize
 from paths import get_db_path
-import logging
 
 logger = logging.getLogger("ws-monitor.watchdog")
 
@@ -36,6 +38,13 @@ DB_NAME = str(get_db_path())
 TABLE = "watchDog"                  # <- constant/whitelist identifiers
 COL_LAST_SENT = "emailtimelastsent"
 
+# Stuck-sensor detection: a channel reporting the exact same value for this
+# long while at least one other channel is moving is treated as frozen.
+STUCK_WINDOW_S = max(30.0, float(os.getenv("WSM_STUCK_WINDOW_S", "300")))
+STUCK_PEER_DELTA_F = max(0.1, float(os.getenv("WSM_STUCK_PEER_DELTA_F", "1.0")))
+
+STUCK_SENSORS = ("tempF", "humid", "flueF", "sttF")
+
 # Metrics keys used by update_metrics()
 # metrics[0] = current; metrics[1] = rate/min
 K_FLUE = "Flue (F)"
@@ -43,10 +52,18 @@ K_STT = "STT (F)"
 K_ROOM = "Room (F)"
 K_HUM  = "Humidity (%)"
 
+
 # === State for sensor_health_check ===
 failure_counts: Dict[str, int] = {'tempF': 0, 'humid': 0, 'flueF': 0, 'sttF': 0}
 last_alert_time: Dict[str, float] = {k: 0.0 for k in failure_counts}
 in_failure_state: Dict[str, bool] = {k: False for k in failure_counts}
+
+# === State for stuck_sensor_check ===
+_stuck_windows: Dict[str, Deque[Tuple[float, Optional[float]]]] = {k: deque() for k in STUCK_SENSORS}
+_stuck_in_alert: Dict[str, bool] = {k: False for k in STUCK_SENSORS}
+_stuck_last_alert_time: Dict[str, float] = {k: 0.0 for k in STUCK_SENSORS}
+_stuck_persisted: Dict[str, bool] = {k: False for k in STUCK_SENSORS}
+_stuck_value: Dict[str, Optional[float]] = {k: None for k in STUCK_SENSORS}
 
 _monotonic = time.monotonic  # localize for tiny perf win
 
@@ -243,3 +260,101 @@ def sensor_health_check(bad_sensors: Set[str]) -> None:
                     in_failure_state[sensor] = True
         except Exception:
             logger.exception("unable to send sensor health alert")
+
+
+def _sensor_frozen(sensor: str, now: float) -> bool:
+    """True if the channel has held the exact same value for STUCK_WINDOW_S."""
+    window = _stuck_windows[sensor]
+    if not window or now - window[0][0] < STUCK_WINDOW_S:
+        return False
+    first = window[0][1]
+    return all(value == first for _, value in window)
+
+
+def _peer_active(sensor: str, now: float) -> bool:
+    """True if any other channel moved by >= STUCK_PEER_DELTA_F recently."""
+    for peer in STUCK_SENSORS:
+        if peer == sensor:
+            continue
+        window = _stuck_windows[peer]
+        values = [value for _, value in window if value is not None]
+        if len(values) >= 2 and (max(values) - min(values)) >= STUCK_PEER_DELTA_F:
+            return True
+    return False
+
+
+def _set_stuck_status(db_path: Optional[str], sensor: str, stuck: bool) -> None:
+    """Persist the freeze flag for the dashboard tile indicator."""
+    try:
+        path = db_path or DB_NAME
+        _ensure_database(path)
+        with connect(path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO sensor_status(sensor, stuck, changed_at) "
+                "VALUES (?, ?, datetime('now','localtime'))",
+                (sensor, 1 if stuck else 0),
+            )
+            conn.commit()
+    except Exception:
+        logger.exception("unable to persist stuck status for %s", sensor)
+
+
+def stuck_sensor_check(values: Dict[str, Optional[float]], db_path: Optional[str] = None) -> None:
+    """Update per-channel freeze detection and route alerts via Telegram.
+
+    A channel is 'stuck' when it reports the exact same value across the full
+    STUCK_WINDOW_S window while at least one other channel moved by >=
+    STUCK_PEER_DELTA_F in that window. A flat but healthy cold stove never
+    triggers (no peer movement); a channel frozen mid-burn does.
+    """
+    now = _monotonic()
+    for sensor in STUCK_SENSORS:
+        window = _stuck_windows[sensor]
+        while window and now - window[0][0] > STUCK_WINDOW_S:
+            window.popleft()
+        value = values.get(sensor)
+        if value is not None:
+            window.append((now, value))
+
+    messages: List[str] = []
+    newly_stuck: Set[str] = set()
+
+    for sensor in STUCK_SENSORS:
+        flagged = _stuck_in_alert[sensor]
+        frozen_now = _sensor_frozen(sensor, now)
+        ref = _stuck_value[sensor]
+
+        if flagged:
+            # Exit on a real value change only; sampling gaps (None) never
+            # count as movement, so a freeze ends only when the channel moves.
+            if any(value != ref for _, value in _stuck_windows[sensor]):
+                messages.append(f"[RECOVERY] {sensor} is no longer stuck (value changed)")
+                _stuck_in_alert[sensor] = False
+                _stuck_value[sensor] = None
+        elif frozen_now and _peer_active(sensor, now):
+            if now - _stuck_last_alert_time[sensor] >= ALERT_COOLDOWN_SEC:
+                messages.append(
+                    f"[ALERT] {sensor} appears stuck: identical for {int(STUCK_WINDOW_S)}s "
+                    "while another channel is moving"
+                )
+                # Throttle retries to once per cooldown even when delivery fails.
+                _stuck_last_alert_time[sensor] = now
+                newly_stuck.add(sensor)
+
+        stuck = _stuck_in_alert[sensor] or (frozen_now and _peer_active(sensor, now))
+        if stuck != _stuck_persisted[sensor]:
+            _set_stuck_status(db_path, sensor, stuck)
+            _stuck_persisted[sensor] = stuck
+
+    if messages:
+        logger.info("stuck sensor alert: %s", messages)
+        try:
+            # Delivery-gated: only latch the alert state after Telegram accepts
+            # the message; otherwise retry once the cooldown elapses while the
+            # freeze persists.
+            if send_message("\n".join(messages)):
+                for sensor in newly_stuck:
+                    _stuck_value[sensor] = _stuck_windows[sensor][0][1]
+                    _stuck_in_alert[sensor] = True
+        except Exception:
+            logger.exception("unable to send stuck sensor alert")

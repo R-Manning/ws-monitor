@@ -11,9 +11,10 @@ from logging_setup import configure_logging
 from sensors import create_reader
 
 try:
-    from watchdog import sensor_health_check, watchdog
+    from watchdog import sensor_health_check, stuck_sensor_check, watchdog
 except ImportError:  # Alerting is optional and must not disable collection.
     sensor_health_check = None
+    stuck_sensor_check = None
     watchdog = None
 
 
@@ -82,6 +83,11 @@ def run(config: Any, samples: Optional[int] = None, once: bool = False, diagnose
                     sensor_health_check(bad)
                 except Exception:
                     logger.exception("sensor health alert failed")
+            if stuck_sensor_check is not None:
+                try:
+                    stuck_sensor_check(values, str(config.db_path))
+                except Exception:
+                    logger.exception("stuck-sensor check failed")
             if watchdog is not None:
                 try:
                     watchdog(str(config.db_path))

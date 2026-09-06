@@ -29,6 +29,7 @@ from flask import Response, request
 from paths import get_db_path
 from database import connect, initialize
 from metrics import get_metrics
+from telegramalert import send_message
 from threading import Lock, Timer
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
@@ -259,9 +260,33 @@ def _build_figure(timeframe_minutes: int, compact: bool) -> go.Figure:
     return fig
 
 
+_STUCK_SENSOR_MAP = {
+    "Flue (F)": "flueF",
+    "STT (F)": "sttF",
+    "Room (F)": "tempF",
+    "Humidity (%)": "humid",
+}
+
+
+def _stuck_sensors() -> set:
+    """Sensors currently flagged frozen by the watchdog (for the ⚠ tile mark)."""
+    try:
+        with connect(DB_PATH) as conn:
+            rows = conn.execute("SELECT sensor FROM sensor_status WHERE stuck = 1").fetchall()
+        return {row[0] for row in rows}
+    except Exception:
+        return set()
+
+
 def update_metrics() -> list[dict]:
     """Return current values and rate/min rows without pandas."""
     rows = get_metrics(DB_PATH, ensure_schema=False)
+    stuck = _stuck_sensors()
+    if stuck and rows:
+        for label, sensor in _STUCK_SENSOR_MAP.items():
+            value = rows[0].get(label)
+            if sensor in stuck and isinstance(value, (int, float)):
+                rows[0][label] = f"{value} ⚠"
     return [
         {key: ("Unavailable" if value is None else value) for key, value in row.items()}
         for row in rows
@@ -1034,6 +1059,29 @@ app.layout = dmc.MantineProvider(
                                         style={"position": "absolute", "inset": 0, "width": "100%", "height": "100%", "objectFit": "contain"},
                                     ),
                                 ),
+                                html.Div(
+                                    [
+                                        dmc.Button(
+                                            "Send Test Alert",
+                                            id="test-alert-button",
+                                            size="xs",
+                                            variant="outline",
+                                            style={"marginRight": "8px"},
+                                        ),
+                                        html.Span(id="test-alert-status", style={"fontSize": "12px"}),
+                                    ],
+                                    style={
+                                        "display": "flex",
+                                        "alignItems": "center",
+                                        "justifyContent": "center",
+                                        "marginTop": "8px",
+                                    },
+                                ),
+                                html.Div(
+                                    "Last Telegram sent: never",
+                                    id="last-tg-readout",
+                                    style={"color": "white", "fontSize": "12px", "textAlign": "center", "marginTop": "2px"},
+                                ),
                             ],
                             span=12, md=6,
                         ),
@@ -1156,8 +1204,46 @@ def refresh_interval(_n):
     """
     sample_period_s, _ = get_settings_cached()
     return max(1, int(sample_period_s)) * 1000
-    
-    
+
+
+@app.callback(
+    Output("test-alert-status", "children"),
+    Input("test-alert-button", "n_clicks"),
+    prevent_initial_call=True,
+)
+def send_test_alert(_n_clicks) -> html.Span:
+    """Send a verification message through the live Telegram pipeline."""
+    ts = time.strftime("%H:%M:%S")
+    try:
+        ok = send_message("Test alert from Wood Stove Monitor — Telegram pipeline OK.")
+    except Exception:
+        ok = False
+    if ok:
+        return html.Span(
+            f"Sent at {ts} — check your Telegram",
+            style={"color": "lime", "fontSize": "12px"},
+        )
+    return html.Span(
+        f"Send failed at {ts} — check token / chat ID / network",
+        style={"color": "tomato", "fontSize": "12px"},
+    )
+
+
+@app.callback(Output("last-tg-readout", "children"), Input("interval-component", "n_intervals"))
+def last_telegram_sent(_n) -> html.Span:
+    """Show when the Telegram channel last sent a real message."""
+    value = None
+    try:
+        with connect(DB_PATH) as conn:
+            row = conn.execute("SELECT emailtimelastsent FROM watchDog LIMIT 1").fetchone()
+            if row:
+                value = row[0]
+    except Exception:
+        pass
+    text = f"Last Telegram sent: {value}" if value else "Last Telegram sent: never"
+    return html.Span(text, style={"color": "white", "fontSize": "12px"})
+
+
 def _shutdown(*_args):
     """Handle SIGINT/SIGTERM: tear down WebRTC and exit cleanly."""
     try:
