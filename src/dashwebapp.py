@@ -1,4 +1,5 @@
 # dash_app.py
+import logging
 import os
 import time
 import threading
@@ -16,6 +17,11 @@ if not env_path.exists():
     raise RuntimeError(f".env file not found at {env_path}")
 load_dotenv(env_path)
 
+# Native video diagnostics can include the full RTSP URL.
+os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
+os.environ["OPENCV_VIDEOCAPTURE_DEBUG"] = "0"
+os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"  # AV_LOG_QUIET
+
 import cv2
 import pandas as pd
 import plotly.express as px
@@ -30,6 +36,7 @@ from paths import get_db_path
 from threading import Lock, Timer
 
 
+camera_logger = logging.getLogger("ws-monitor.camera")
 cv2.setNumThreads(1)
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
 
@@ -340,12 +347,13 @@ def update_metrics() -> list[dict]:
 def _open_capture():
     # Tell FFmpeg/OpenCV to be conservative
     # You can also export OPENCV_FFMPEG_CAPTURE_OPTIONS env var if desired.
-    cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # tiny buffer
-    # Request smaller decode size if your cam supports stream params; often ignored:
-    # cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
-    return cap
+    try:
+        cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # tiny buffer
+        return cap
+    except cv2.error as exc:
+        camera_logger.warning("Camera capture setup failed (%s)", type(exc).__name__)
+        return None
 
 def capture_loop():
     """Read RTSP, but only *decode* the frames we intend to show."""
@@ -356,7 +364,12 @@ def capture_loop():
 
     while not stop_event.is_set():
         cap = _open_capture()
+        if cap is None:
+            time.sleep(reconnect)
+            continue
         if not cap.isOpened():
+            cap.release()
+            camera_logger.warning("Unable to open the RTSP camera")
             time.sleep(reconnect)
             continue
 
