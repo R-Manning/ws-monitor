@@ -1,0 +1,17 @@
+[Unit]
+Description=Wood Stove Monitor sensor collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/ws-monitor
+EnvironmentFile=-/etc/ws-monitor/ws-monitor.env
+Environment=PYTHONPATH=/opt/ws-monitor/src
+ExecStart=/opt/ws-monitor/.venv/bin/python /opt/ws-monitor/src/rpiacqscript.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,12 +1,15 @@
 import logging
 import os
 
-import requests
+try:
+    import requests
+except ImportError:  # Telegram is an optional alerting integration.
+    requests = None
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-session = requests.Session()
+session = requests.Session() if requests is not None else None
 logger = logging.getLogger("ws-monitor.telegram")
 
 # urllib3 debug records can contain the request path, including the bot token.
@@ -16,7 +19,7 @@ logging.getLogger("urllib3.util.retry").setLevel(logging.INFO)
 
 def send_message(message: str, verification: bool = True) -> bool:
     """Send a message via Telegram bot."""
-    if not BOT_TOKEN or not CHAT_ID:
+    if session is None or not BOT_TOKEN or not CHAT_ID:
         return False
     try:
         resp = session.post(
@@ -33,6 +36,6 @@ def send_message(message: str, verification: bool = True) -> bool:
         else:
             logger.warning("Telegram delivery failed (HTTP error)")
         return False
-    except (requests.RequestException, ValueError) as exc:
+    except Exception as exc:
         logger.warning("Telegram delivery failed (%s)", type(exc).__name__)
         return False

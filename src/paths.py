@@ -7,7 +7,7 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[0]
 
 def default_db_path() -> Path:
-    return project_root() / "resources" / "house_environment.db"
+    return project_root().parent / "var" / "ws-monitor.db"
 
 def get_db_path() -> Path:
     # systemd (or you) can override this

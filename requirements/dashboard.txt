@@ -1,0 +1,8 @@
+# Web dashboard and camera support. This is intentionally separate so the
+# collector and simulated macOS setup do not need these larger packages.
+-r base.txt
+dash==3.2.0
+dash_mantine_components==0.13.0a3
+Flask==3.1.2
+aiortc==1.15.0
+plotly==6.3.0

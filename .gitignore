@@ -137,12 +137,19 @@ celerybeat.pid
 # Environments
 .env
 .envrc
+.env.*
+!.env_template
 .venv
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Runtime SQLite database and WAL sidecars
+*.db
+*.db-shm
+*.db-wal
 
 # Spyder project settings
 .spyderproject
@@ -178,6 +185,9 @@ cython_debug/
 *.db
 *.db-shm
 *.db-wal
+var/
+runtime/
+logs/
 
 # CMake
 cmake-build-*/

@@ -1,0 +1,15 @@
+[Unit]
+Description=Watchdog for ws-monitor-dashboard.service (restarts on hang/failure)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=DASHWEB_SERVICE=ws-monitor-dashboard.service
+ExecStart=/usr/local/sbin/ws-monitor-watchdog.sh
+Restart=always
+RestartSec=5
+SyslogIdentifier=ws-monitor-watchdog
+
+[Install]
+WantedBy=multi-user.target
