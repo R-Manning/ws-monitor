@@ -7,7 +7,6 @@ import math
 import re
 import json
 import asyncio
-import traceback
 import uuid
 from contextlib import closing
 from typing import Tuple, List, Dict, Any, Optional
@@ -339,7 +338,7 @@ def _ensure_webrtc_running():
             )
             future.result(timeout=15)
         except Exception as exc:
-            print(f"WEBRTC: player init failed: {exc}", flush=True)
+            print(f"WEBRTC: player init failed: {type(exc).__name__}", flush=True)
             return
 
         # Launch camera-health monitor + stale-peer sweeper on the loop.
@@ -476,7 +475,7 @@ async def _restart_player():
         _webrtc_relay = MediaRelay()
         _webrtc_player = MediaPlayer(RTSP_URL, decode=False)
     except Exception as exc:
-        print(f"WEBRTC: player restart failed: {exc}", flush=True)
+        print(f"WEBRTC: player restart failed: {type(exc).__name__}", flush=True)
         _webrtc_player = None
 
 
@@ -569,8 +568,9 @@ def webrtc_offer():
 
     try:
         _ensure_webrtc_running()
-    except Exception as e:
-        return Response(f"Camera connection failed: {e}", status=503)
+    except Exception as exc:
+        print(f"WEBRTC: camera startup failed: {type(exc).__name__}", flush=True)
+        return Response("Camera connection failed", status=503, mimetype="text/plain")
 
     async def _handle():
         global active_viewers
@@ -648,9 +648,13 @@ def webrtc_offer():
     try:
         future = asyncio.run_coroutine_threadsafe(_handle(), _webrtc_loop)
         result = future.result(timeout=10)
-    except Exception as e:
-        traceback.print_exc()
-        return Response(json.dumps({"error": str(e)}), status=500, mimetype="application/json")
+    except Exception as exc:
+        print(f"WEBRTC: offer failed: {type(exc).__name__}", flush=True)
+        return Response(
+            json.dumps({"error": "WebRTC offer failed"}),
+            status=500,
+            mimetype="application/json",
+        )
 
     return Response(
         json.dumps(result),
@@ -663,8 +667,19 @@ def webrtc_offer():
 def webrtc_answer():
     """Receive the browser's SDP answer to complete signaling."""
     params = request.json
-    answer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
-    pc_id = params.get("pc_id", "")
+    if (
+        not isinstance(params, dict)
+        or params.get("type") != "answer"
+        or not isinstance(params.get("sdp"), str)
+        or not isinstance(params.get("pc_id"), str)
+    ):
+        return Response(
+            json.dumps({"error": "Invalid WebRTC answer"}),
+            status=400,
+            mimetype="application/json",
+        )
+    answer = RTCSessionDescription(sdp=params["sdp"], type="answer")
+    pc_id = params["pc_id"]
 
     entry = _pending_peer_connections.pop(pc_id, None)
     pc = entry[0] if entry else None
@@ -677,9 +692,13 @@ def webrtc_answer():
     try:
         future = asyncio.run_coroutine_threadsafe(_handle(), _webrtc_loop)
         future.result(timeout=5)
-    except Exception as e:
-        traceback.print_exc()
-        return Response(json.dumps({"error": str(e)}), status=500, mimetype="application/json")
+    except Exception as exc:
+        print(f"WEBRTC: answer failed: {type(exc).__name__}", flush=True)
+        return Response(
+            json.dumps({"error": "WebRTC answer failed"}),
+            status=500,
+            mimetype="application/json",
+        )
 
     return Response(
         json.dumps({"ok": True}),
